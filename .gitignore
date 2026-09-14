@@ -1,0 +1,11 @@
+.env
+.venv/
+.idea/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.DS_Store
+weaviate_data/
+*.egg-info/
+output/

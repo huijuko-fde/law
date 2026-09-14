@@ -1,0 +1,21 @@
+{
+  "law_id": "sample-admrul", "mst": "200", "law_name": "표본 행정규칙", "law_abbr": "",
+  "law_type": "고시", "doc_target": "admrul", "doc_kind": "행정규칙", "adm_uid": "admrul:sample-admrul",
+  "promulgation_date": "20240101", "enforcement_date": "20240201", "revision_date": "20240101",
+  "revision_type": "제정", "is_current": true,
+  "source": {"source_url": "https://example.test/admrul"},
+  "body": {"format": "articles", "article_count": 1, "articles": [{
+    "provision_id": "admrul:표본행정규칙#JO0001", "article_no": "제1조", "article_title": "목적",
+    "content": "제1조(목적) 이 규칙은 표본을 정한다.", "relations": []
+  }]},
+  "addenda": [{"promulgation_date": "20240101", "promulgation_no": "1", "content": "부칙 원문"}],
+  "appendices": [
+    {"no": "0001", "branch": "00", "kind": "별표", "title": "기준표", "content": "별표 원문",
+     "is_file_only": false, "files": [], "provision_id": "admrul:표본행정규칙#BYL0001"},
+    {"no": "0002", "branch": "00", "kind": "별지", "title": "신청서", "content": "",
+     "is_file_only": true, "view_url": "", "file_url": "https://example.test/f2",
+     "files": [{"type": "hwp", "url": "https://example.test/f2", "name": ""}],
+     "provision_id": "admrul:표본행정규칙#BJ0002"}
+  ],
+  "attachments": [{"name": "표본 행정규칙 원문.pdf", "url": "https://example.test/raw"}]
+}

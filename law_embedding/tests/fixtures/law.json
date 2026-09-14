@@ -1,0 +1,24 @@
+{
+  "law_id": "sample-law", "mst": "100", "version_uid": "v-20240101",
+  "law_name": "표본법", "law_abbr": "표본", "law_type": "법률",
+  "promulgation_date": "20240101", "enforcement_date": "2024.02.01",
+  "revision_date": "20240102", "revision_type": "일부개정",
+  "is_current": true, "is_future": false,
+  "promulgation_no": "제100호",
+  "amendment_text": "제1조를 다음과 같이 한다 ...", "revision_reason": "제도 개선을 위하여 ...",
+  "future_enforcement_dates": ["2025-01-01"],
+  "basic_info": {"소관부처": {"content": "표본부", "소관부처코드": "9999"}},
+  "source": {"source_url": "https://example.test/law"},
+  "body": {"format": "structured", "article_count": 1, "articles": [{
+    "article_no": "제1조", "article_title": "목적", "chapter": "제1장 총칙",
+    "content": "제1조(목적) 원문을 보존한다.", "enforcement_date": "20240201",
+    "provision_id": "law:표본법#JO0001",
+    "relations": [{"reference_id": "law:다른법#JO0002", "target_mst": "200", "resolve_method": "pop",
+      "relation_type": "citation", "source_clause": "제1조", "line_text": "다른법 제2조를 준용한다",
+      "link_text": "다른법", "target_article_title": "정의", "target_url": "https://www.law.go.kr/다른법"}]
+  }]},
+  "addenda": [{"promulgation_date": "20240101", "promulgation_no": "1", "content": "부칙 원문"}],
+  "appendices": [{"no": "0001", "branch": "00", "kind": "별표", "title": "기준표",
+    "enforcement_date": "20240201", "content": "별표 원문", "provision_id": "law:표본법#BYL0001"}]
+}
+

@@ -1,0 +1,30 @@
+services:
+  weaviate:
+    image: ${WEAVIATE_IMAGE:-cr.weaviate.io/semitechnologies/weaviate:1.29.0}
+    ports:
+      # host 8080 은 temporal-ui 가 쓰므로 8081 로 매핑
+      - "127.0.0.1:8081:8080"
+      - "127.0.0.1:50051:50051"
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+    restart: unless-stopped
+    environment:
+      QUERY_DEFAULTS_LIMIT: "25"
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: /var/lib/weaviate
+      DEFAULT_VECTORIZER_MODULE: none
+      ENABLE_MODULES: ""
+      # 한국어 형태소 토크나이저 — search_text 의 BM25(하이브리드 키워드 절반)가 여기 의존한다.
+      # 끄면 컬렉션 생성이 trigram 으로 자동 폴백되고 한국어 키워드 검색 품질이 떨어진다.
+      ENABLE_TOKENIZER_KAGOME_KR: "true"
+      CLUSTER_HOSTNAME: node1
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/v1/.well-known/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+volumes:
+  weaviate_data:
+

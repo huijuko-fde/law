@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools==78.1.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "law-indexer"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = [
+  "weaviate-client==4.16.4",
+  "sentence-transformers==4.1.0",
+  "python-dotenv==1.1.0",
+  "torch",
+  "pillow>=11.3.0",
+  "temporalio",
+  "pyarrow>=21.0.0",
+]
+
+[dependency-groups]
+dev = ["pytest==8.3.5"]
+
+# torch 를 CPU 전용 인덱스에서 받아 CUDA(nvidia-*) 라이브러리 유입을 막는다(이미지 ~17GB→수GB).
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
