@@ -4,7 +4,9 @@ from html import unescape
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from .chunking import split_prose, split_table_like
+from .chunking import (
+    MAX_CHAPTER_CTX_CHARS, clamp_search_prefix, max_content_chars, split_prose, split_table_like,
+)
 from .models import LegalProvision
 from .preprocess import is_deleted_appendix_content
 
@@ -169,16 +171,27 @@ def _common(data: Dict[str, Any], path: Path, doc_source: str = "law",
         #   행정규칙류 API(행정규칙기본정보)는 `소관부처명`(평문)으로 준다 — 키 이름이 다르다.
         #   법령 키만 보면 행정규칙·학칙·공단정관 세 컬렉션의 ministry 가 전부 비어 부처 필터가
         #   죽는다(실측: admrul 10/10 · public 2/2 None). 두 키를 다 받는다.
-        ministry=_ministry(basic.get("소관부처") or basic.get("소관부처명")),
+        # 그리고 대법원·헌법재판소 계열은 `소관부처명`이 **빈 문자열**로 오고 부처명은
+        #   `상위부처명`에만 있다(실측: ADMRUL 22,649문서 중 정확히 55건 — 대법원 51·
+        #   헌법재판소 4, 청크 1,091개). 폴백이 없으면 이 문서들만 부처 필터에서 사라진다.
+        ministry=_ministry(basic.get("소관부처"), basic.get("소관부처명"), basic.get("상위부처명")),
     )
 
 
-def _ministry(value: Any) -> Optional[str]:
-    """basic_info.소관부처 에서 부처명만 뽑는다. 값이 {content, 소관부처코드} 중첩객체라
-    content(부처명)를 쓰고, 혹시 평문이면 그대로 쓴다."""
-    if isinstance(value, dict):
-        return _text(value.get("content"))
-    return _text(value)
+def _ministry(*values: Any) -> Optional[str]:
+    """basic_info 의 부처 키들에서 부처명만 뽑는다(앞에 준 키가 우선).
+
+    법령 API 는 `소관부처`를 {content: 부처명, 소관부처코드: ...} 중첩객체로 주고, 행정규칙류
+    API 는 `소관부처명`을 평문으로 준다. 대법원·헌법재판소 계열은 그 둘이 비고 `상위부처명`에만
+    부처명이 있어 마지막 폴백으로 받는다 — `상위부처명`은 소속 상위기관(예: 농림축산검역본부 →
+    농림축산식품부)이라 소관부처명이 **있을 때는 쓰지 않는다**(더 좁은 기관명이 정답)."""
+    for value in values:
+        if isinstance(value, dict):
+            value = value.get("content")
+        text = _text(value)
+        if text:
+            return text
+    return None
 
 
 def _text(value: Any) -> Optional[str]:
@@ -296,14 +309,20 @@ def _make_json(data: Dict[str, Any], path: Path, unit: Dict[str, Any], unit_type
     조문 대부분 4000자 이하 — 무의미하게 쪼개지 않는다). 넘을 때만 문단/행 경계로 나눈다.
     별표(APPENDIX)는 표 형태일 수 있어 행 경계 분할(split_table_like), 조문/부칙은 문단 경계
     분할(split_prose)을 쓴다. 여러 조각으로 나뉘어도 각 조각의 search_text 에 장·조번호·제목을
-    그대로 반복한다(§5-1) — 문맥이 빠지지 않도록."""
+    그대로 반복한다(§5-1) — 문맥이 빠지지 않도록.
+
+    **토큰 예산**: search_text 는 접두(문서명·종류·장 경로·조번호·제목) + content 조각이고,
+    임베딩 모델(bge-m3)은 8,192토큰까지만 본다. 넘으면 뒤가 말없이 잘려 그 부분은 벡터에
+    아예 안 들어간다. 그래서 접두를 먼저 확정해 그 길이를 예산에서 빼고, 남은 예산을
+    hard_max_chars 로 넘겨 **content 조각이 반드시 그 안에 들어가게** 한다(chunking 참고).
+    조각이 몇 개로 나뉘든 provision_id 는 그대로고 chunk_index/chunk_count 만 늘어난다."""
     common = _common(data, path, doc_source=doc_source, source_repository=source_repository)
     content = str(unit.get("content") or "")
     chapter = _text(unit.get("chapter")) if unit_type == "ARTICLE" else None
     # 임베딩 문맥은 **장 경로 전체**를 쓴다(있으면). `chapter` 는 가장 가까운 한 단계라
     #   "제2절 해고" 만 남아 어느 장 밑인지가 사라진다. 필드값은 종전대로 nearest 를 유지하고
     #   (표시·facet), 검색 텍스트에만 경로를 넣는다.
-    chapter_ctx = (_text(unit.get("chapter_path")) or chapter) if unit_type == "ARTICLE" else None
+    chapter_ctx = _chapter_context(unit, chapter) if unit_type == "ARTICLE" else None
     # 약칭·별칭(영문명·한자명)은 search_text 에 넣지 않는다.
     #   · 벡터는 search_text 로 만들어지는데, 별칭을 섞으면 같은 조문이라도 별칭 유무에 따라
     #     텍스트가 달라져 이전에 계산해 둔 벡터를 재사용할 수 없다(실측: 재사용률 43%까지 하락).
@@ -318,8 +337,11 @@ def _make_json(data: Dict[str, Any], path: Path, unit: Dict[str, Any], unit_type
     relation_refs = _relation_refs(unit)
     scheduled = _scheduled(unit)
 
+    # 접두를 먼저 확정한다 — 조각마다 이 접두가 붙으므로 접두 길이가 곧 content 예산을 깎는다.
+    prefix = clamp_search_prefix(build_search_text(common["law_name"], common["law_type"],
+                                                  chapter_ctx, unit_no, title))
     splitter = split_table_like if unit_type == "APPENDIX" else split_prose
-    parts = splitter(content) if content else [content]
+    parts = splitter(content, hard_max_chars=max_content_chars(len(prefix))) if content else [content]
     total = len(parts)
 
     result = []
@@ -330,8 +352,7 @@ def _make_json(data: Dict[str, Any], path: Path, unit: Dict[str, Any], unit_type
             chunk_id=chunk_id, provision_id=provision_id, parent_provision_id=parent_provision_id,
             reference_ids=reference_ids if index == 0 else [], file_id=None, unit_type=unit_type,
             unit_no=unit_no, unit_title=title, chapter=chapter, content=part,
-            search_text=build_search_text(common["law_name"], common["law_type"],
-                                          chapter_ctx, unit_no, title, part),
+            search_text=build_search_text(prefix, part),
             source_type="JSON", file_name=None, file_url=None, page_no=None,
             chunk_index=index, chunk_count=total,
             enforcement_date=enforcement_date,
@@ -342,6 +363,21 @@ def _make_json(data: Dict[str, Any], path: Path, unit: Dict[str, Any], unit_type
             ordinance_delegations=ordinance_delegations if index == 0 else None, **common,
         ))
     return result
+
+
+def _chapter_context(unit: Dict[str, Any], chapter: Optional[str]) -> Optional[str]:
+    """search_text 접두에 넣을 장 문맥. 기본은 장 **경로 전체**(chapter_path)다.
+
+    단, 경로가 비정상적으로 길면(수집기 아웃라인 파서가 장 제목 대신 장 본문을 통째로 넣은
+    문서가 실제로 있다 — 실측 최대 14,243자) 접두만으로 임베딩 토큰 예산을 다 먹어 본문이
+    벡터에 못 들어간다. 그럴 땐 가장 가까운 한 단계(chapter)로 내려가고, 그것도 길면 자른다.
+    정상 문서(실측 344,000개 조문 중 400자 초과 5개뿐)는 전혀 영향받지 않는다."""
+    path_ctx = _text(unit.get("chapter_path")) or chapter
+    if not path_ctx or len(path_ctx) <= MAX_CHAPTER_CTX_CHARS:
+        return path_ctx
+    if chapter and len(chapter) <= MAX_CHAPTER_CTX_CHARS:
+        return chapter
+    return path_ctx[:MAX_CHAPTER_CTX_CHARS].rstrip() or None
 
 
 def _combined_addendum_unit(addenda: Iterable[Any]) -> Optional[Dict[str, Any]]:
