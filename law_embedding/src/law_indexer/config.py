@@ -1,9 +1,18 @@
 from dataclasses import dataclass
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
+
+
+def _port(name: str, default: str) -> int:
+    """포트 환경변수 — 쿠버네티스가 같은 이름의 Service 링크를 `WEAVIATE_GRPC_PORT=tcp://10.x.x.x:50051`
+    꼴로 주입해 숫자가 아닐 수 있다(운영 코드서빙 실측 2026-10-23). 끝의 숫자만 읽는다."""
+    raw = os.getenv(name, default)
+    match = re.search(r"(\d+)\s*$", raw)
+    return int(match.group(1)) if match else int(default)
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -209,9 +218,9 @@ class Settings:
         law_collection = os.getenv("LAW_COLLECTION", os.getenv("WEAVIATE_COLLECTION", "LegalProvisionIndex"))
         return cls(
             weaviate_http_host=os.getenv("WEAVIATE_HTTP_HOST", "localhost"),
-            weaviate_http_port=int(os.getenv("WEAVIATE_HTTP_PORT", "8080")),
+            weaviate_http_port=_port("WEAVIATE_HTTP_PORT", "8080"),
             weaviate_grpc_host=os.getenv("WEAVIATE_GRPC_HOST", "localhost"),
-            weaviate_grpc_port=int(os.getenv("WEAVIATE_GRPC_PORT", "50051")),
+            weaviate_grpc_port=_port("WEAVIATE_GRPC_PORT", "50051"),
             weaviate_api_key=os.getenv("WEAVIATE_API_KEY") or None,
             admrul_weaviate_api_key=(os.getenv("ADMRUL_WEAVIATE_API_KEY")
                                      or os.getenv("WEAVIATE_API_KEY") or None),

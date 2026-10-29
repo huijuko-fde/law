@@ -35,8 +35,9 @@ from .package import consume_package, peek_package_source
 from .pipeline import index_documents
 from .weaviate_store import WeaviateStore
 from .worker_workflows import (
-    CONSUME_PACKAGE_ACTIVITY, INITIAL_INDEX_ACTIVITY, ConsumePackageWorkflow,
-    IndexRequest, InitialIndexWorkflow, PackageRequest,
+    CONSUME_PACKAGE_ACTIVITY, CONSUME_ZIP_ACTIVITY, CONVERT_INBOX_ACTIVITY, INITIAL_INDEX_ACTIVITY,
+    ConsumePackageWorkflow, IndexRequest, InitialIndexWorkflow, LawInboxRequest, LawInboxWorkflow,
+    PackageRequest,
 )
 
 log = logging.getLogger("law_embedding.worker")
@@ -132,12 +133,68 @@ def consume_package_activity(req: PackageRequest) -> dict:
     return result
 
 
+@activity.defn(name=CONVERT_INBOX_ACTIVITY)
+def convert_inbox_activity(req: LawInboxRequest) -> list:
+    """수신 폴더의 배달 ZIP(+manifest)을 적재기 ZIP 으로 변환(LAW-28). Weaviate·임베더 불필요."""
+    from .auto_ingest import IngestPaths, manifest_overdue
+    from .inbox_convert import convert_inbox
+    from .ingest_rules import trim_report
+    paths = IngestPaths(Path(req.root)).ensure()
+    with heartbeating():
+        reports = convert_inbox(paths.inbox, paths.converted, done_dir=paths.done, failed_dir=paths.failed)
+    # manifest 없이 유예를 넘긴 ZIP — 조용히 영원히 대기하지 않게 실패 보고로 올린다(워크플로가 멈춤 판정).
+    for name in manifest_overdue(paths, req.manifest_grace_sec):
+        reports.append({"zip": name, "status": "failed",
+                        "errors": [{"error": f"manifest 없이 {req.manifest_grace_sec}초 넘게 대기 — 치우거나 manifest 를 놓고 resume"}]})
+    log.info("convert_inbox(%s) %s", req.root, [(r.get("zip"), r.get("status")) for r in reports])
+    return [trim_report(r) for r in reports]
+
+
+@activity.defn(name=CONSUME_ZIP_ACTIVITY)
+def consume_zip_activity(req: LawInboxRequest) -> dict:
+    """변환된 ZIP 폴더(LAW_ROOT/converted)를 consume-zip 으로 한 번 훑는다(LAW-28). 적재 범위는 매번 새로 읽는다."""
+    from .auto_ingest import IngestPaths, retire
+    from .law_scope import load_law_scope
+    from .zip_consume import consume_zip_folder
+    settings = _get_settings()
+    scope = load_law_scope()
+    embedder = _get_embedder()
+    paths = IngestPaths(Path(req.root)).ensure()
+    with heartbeating():
+        summary = consume_zip_folder(embedder, settings, paths.converted, scope=scope,
+                                     allow_older_version=req.allow_older_version)
+        summary["retired"] = retire(paths, req.retention_days)     # 공유 NFS 보존 정리
+    log.info("consume_zip(%s) done=%s partial=%s failed=%s waiting=%s version_skipped=%s",
+             req.root, summary.get("done"), summary.get("partial"), summary.get("failed"),
+             summary.get("waiting"), summary.get("version_skipped"))
+    return summary
+
+
+WORKFLOWS = [InitialIndexWorkflow, ConsumePackageWorkflow, LawInboxWorkflow]
+ACTIVITIES = [initial_index, consume_package_activity, convert_inbox_activity, consume_zip_activity]
+
+
+def temporal_address() -> str:
+    """TEMPORAL_ADDRESS(host:port) 우선, 없으면 genos 코드서빙이 주입하는 TEMPORAL_HOST/PORT."""
+    return (os.getenv("TEMPORAL_ADDRESS")
+            or f"{os.getenv('TEMPORAL_HOST', 'localhost')}:{os.getenv('TEMPORAL_PORT', '7233')}")
+
+
+def build_worker(client: Client, task_queue: str, executor: ThreadPoolExecutor, workers: int) -> Worker:
+    """워커 조립 — 단독 실행(main)과 수신 앱 안의 동거(ingest_app)가 같은 등록을 쓴다.
+
+    ⚠ max_concurrent_activities 를 **스레드풀 크기와 같게** 못 박는다. 안 주면 기본 100 이라 워커가 최대
+    100건을 물어와 executor 큐에 쌓는데, start_to_close 시계는 큐에서 대기하는 동안에도 돈다."""
+    return Worker(client, task_queue=task_queue, workflows=WORKFLOWS, activities=ACTIVITIES,
+                  activity_executor=executor, max_concurrent_activities=workers)
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     # .env 를 먼저 읽는다 — Settings.from_env() 안의 load_dotenv() 가 아래 os.getenv 보다 늦으면
     # TEMPORAL_* 가 .env 에 있어도 기본값(localhost:7233/default)으로 붙어 기동이 실패한다.
     _get_settings()
-    address = os.getenv("TEMPORAL_ADDRESS", "localhost:7233")
+    address = temporal_address()
     namespace = os.getenv("TEMPORAL_NAMESPACE", "default")
     task_queue = os.getenv("INDEX_TASK_QUEUE", "law-embedding")
     tls = (os.getenv("TEMPORAL_TLS", "false").strip().lower() in {"1", "true", "yes", "on"})
@@ -152,14 +209,7 @@ async def main() -> None:
     #   동안에도 돈다 — 실행도 못 해 보고 타임아웃 나는 activity 가 생긴다.
     workers = int(os.getenv("INDEX_ACTIVITY_WORKERS", "2"))
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        worker = Worker(
-            client,
-            task_queue=task_queue,
-            workflows=[InitialIndexWorkflow, ConsumePackageWorkflow],
-            activities=[initial_index, consume_package_activity],
-            activity_executor=executor,
-            max_concurrent_activities=workers,
-        )
+        worker = build_worker(client, task_queue, executor, workers)
         log.info("[law-embedding worker] task_queue=%s @ %s (ns=%s, tls=%s) 대기 중…",
                  task_queue, address, namespace, tls)
         await worker.run()

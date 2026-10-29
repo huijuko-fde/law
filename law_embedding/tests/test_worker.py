@@ -15,13 +15,29 @@ def test_request_dataclasses():
 def test_workflows_are_defined():
     assert hasattr(ww.InitialIndexWorkflow, "__temporal_workflow_definition")
     assert hasattr(ww.ConsumePackageWorkflow, "__temporal_workflow_definition")
+    assert hasattr(ww.LawInboxWorkflow, "__temporal_workflow_definition")
+    assert ww.LawInboxRequest(root="/x").halt_on_partial is True
 
 
 def test_activities_registered_with_expected_names():
     d1 = getattr(worker.initial_index, "__temporal_activity_definition", None)
     d2 = getattr(worker.consume_package_activity, "__temporal_activity_definition", None)
+    d3 = getattr(worker.convert_inbox_activity, "__temporal_activity_definition", None)
+    d4 = getattr(worker.consume_zip_activity, "__temporal_activity_definition", None)
     assert d1 is not None and d1.name == INITIAL_INDEX_ACTIVITY
     assert d2 is not None and d2.name == CONSUME_PACKAGE_ACTIVITY
+    assert d3 is not None and d3.name == ww.CONVERT_INBOX_ACTIVITY
+    assert d4 is not None and d4.name == ww.CONSUME_ZIP_ACTIVITY
+    assert ww.LawInboxWorkflow in worker.WORKFLOWS and worker.consume_zip_activity in worker.ACTIVITIES
+
+
+def test_temporal_address_prefers_explicit_then_codeserving_env(monkeypatch):
+    monkeypatch.delenv("TEMPORAL_ADDRESS", raising=False)
+    monkeypatch.setenv("TEMPORAL_HOST", "temporal-frontend.temporal.svc.cluster.local")
+    monkeypatch.setenv("TEMPORAL_PORT", "7233")
+    assert worker.temporal_address() == "temporal-frontend.temporal.svc.cluster.local:7233"
+    monkeypatch.setenv("TEMPORAL_ADDRESS", "localhost:7233")
+    assert worker.temporal_address() == "localhost:7233"
 
 
 def test_collection_selector():

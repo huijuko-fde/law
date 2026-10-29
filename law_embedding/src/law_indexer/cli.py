@@ -1,6 +1,7 @@
 import argparse
 import json
 import sys
+import threading
 from pathlib import Path
 from typing import List, Optional
 
@@ -18,7 +19,7 @@ from .zip_consume import consume_zip_folder
 
 # 본문/첨부 순회 적재 명령들 (임베딩 모델 필요)
 INDEX_COMMANDS = {"index", "index-files", "index-attachment-chunks", "index-changeset", "consume-folder",
-                  "consume-zip"}
+                  "consume-zip", "auto-ingest"}
 
 _SOURCES = ("law", "admrul", "schlpub")
 # --source 선택지: 개별 3종 + 전부("both" 는 2컬렉션 시절 이름의 하위호환 별칭 — "all" 과 동일)
@@ -173,6 +174,18 @@ def parser() -> argparse.ArgumentParser:
                     help="consume-folder --nack 과 같다(기본 PACKAGE_NACK_DIR 또는 <package-dir>/nack)")
     cz.add_argument("--allow-older-version", action="store_true",
                     help="consume-folder --allow-older-version 과 같다(수동 복구 전용)")
+
+    ai = sub.add_parser("auto-ingest",
+                        help="수신 폴더(LAW_ROOT)를 변환(inbox_convert) → consume-zip 으로 돌리는 러너. "
+                             "--once 면 한 번만(검증·수동 실행), 아니면 주기 실행(코드서빙 밖에서 띄울 때)")
+    ai.add_argument("--root", type=Path, required=True,
+                    help="수신·처리 루트 — 그 밑에 done/ failed/ rejected/ converted/ runs/ 를 둔다")
+    ai.add_argument("--once", action="store_true", help="한 번만 돌고 종료(멈춤 사유가 있으면 exit 2)")
+    ai.add_argument("--interval", type=int, default=600, help="주기 실행 간격(초)")
+    ai.add_argument("--continue-on-partial", action="store_true",
+                    help="부분 완료(partial)를 멈춤 사유로 보지 않는다(기본은 멈춤)")
+    ai.add_argument("--retention-days", type=int, default=30,
+                    help="적재가 끝난 산출물(done/·converted/done/·processed/ 등) 보존 일수. 0 = 지우지 않음")
 
     search = sub.add_parser("search")
     search.add_argument("--query", required=True)
@@ -458,6 +471,21 @@ def main(argv=None):
                                             allow_older_version=args.allow_older_version)
                 print(json.dumps(result, ensure_ascii=False, indent=2))
                 raise SystemExit(_failure_code(result))
+
+            if args.command == "auto-ingest":
+                # 수신 폴더 → 변환 → consume-zip 러너(LAW-28). 코드서빙에서는 ingest_app 이 같은 러너를 띄운다.
+                from .auto_ingest import IngestPaths, Runner, build_run_fn
+                paths = IngestPaths(args.root).ensure()
+                runner = Runner(paths, build_run_fn(paths, embedder, settings,
+                                                    halt_on_partial=not args.continue_on_partial),
+                                interval_sec=args.interval, retention_days=args.retention_days)
+                if args.once:
+                    record = runner.sweep("cli") or {"verdict": "halted", "halt": runner.halted()}
+                    print(json.dumps(record, ensure_ascii=False, indent=2))
+                    raise SystemExit(2 if record.get("verdict") in ("halt", "halted") else 0)
+                runner.start()
+                runner.trigger("startup")
+                threading.Event().wait()                   # 러너 스레드가 도는 동안 대기(Ctrl-C 로 종료)
 
             # index-files / index-attachment-chunks: --source 로 컬렉션·repo 확정(source=레포 1:1)
             collection = _repo_config(settings, args.source)[3]

@@ -3,6 +3,7 @@
 외부 접속 없음: Weaviate 는 pipeline.WeaviateStore 를 fake 로 바꾸고(test_consume_folder.py 와 같은 방식),
 임베딩은 fake, 전처리기는 package.DocParserClient 를 fake 로 바꾼다. 적재는 실제 consume_folder 를 탄다.
 """
+import collections
 import dataclasses
 import fcntl
 import hashlib
@@ -534,3 +535,34 @@ def test_quality_guard_surfaces_in_summary_and_exit_code(inbox, vdb, settings, m
     record = _state(inbox, sha)
     assert record["summary"]["quality_guard"]["reason"] == "dropped_chunks_had_content"
     assert any(i["code"] == "quality_guard" for i in record["issues"])
+
+
+def test_runner_end_to_end_with_real_delivery(tmp_path, vdb, settings):
+    """투라인 실제 배달분으로 수신 폴더 → 변환 → consume-zip 전 구간. 재전송은 duplicate 로 끝난다(변환 결정성)."""
+    import shutil
+    from law_indexer import auto_ingest as A
+    from law_indexer.inbox_convert import convert_inbox
+
+    fix = Path(__file__).parent / "fixtures" / "inbox"
+    paths = A.IngestPaths(tmp_path / "root").ensure()
+
+    def deliver():
+        for suffix in (".zip", ".manifest.json"):
+            shutil.copy(fix / f"batch-20261021-001{suffix}", paths.inbox / f"batch-20261021-001{suffix}")
+
+    def consume(folder):
+        return consume_zip_folder(_Embedder(), settings, folder)
+
+    deliver()
+    record = A.run_once(paths, convert_inbox, consume, trigger="test")
+    assert record["verdict"] == "ok", record.get("reasons") or record.get("traceback")
+    assert record["convert"][0]["status"] == "converted" and record["consume"]["done"] == 1
+    assert (paths.done / "batch-20261021-001.zip").exists()                      # 원본 쌍 보관
+    assert (paths.converted / "done" / "batch-20261021-001.zip").exists()        # 변환본 보관
+    assert vdb.versions("001282") == ["001282:290605:20261002"]
+    kinds = collections.Counter(o.unit_type for o in vdb.upserted)
+    assert kinds["ARTICLE"] == 4 and kinds["APPENDIX"] == 2                      # 본문 있는 별표 → APPENDIX 청크
+
+    deliver()                                                                    # 같은 배달 재전송
+    record = A.run_once(paths, convert_inbox, consume, trigger="test")
+    assert record["verdict"] == "ok" and record["consume"]["duplicate"] == 1 and record["consume"]["done"] == 0

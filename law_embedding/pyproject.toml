@@ -17,7 +17,11 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest==8.3.5"]
+dev = [
+    "fastapi>=0.128.8",
+    "pytest==8.3.5",
+    "python-multipart>=0.0.20",
+]
 
 # torch 를 CPU 전용 인덱스에서 받아 CUDA(nvidia-*) 라이브러리 유입을 막는다(이미지 ~17GB→수GB).
 [[tool.uv.index]]

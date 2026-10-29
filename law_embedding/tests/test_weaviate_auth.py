@@ -15,6 +15,18 @@ def _no_dotenv(monkeypatch):
     monkeypatch.setattr("law_indexer.config.load_dotenv", lambda *a, **k: False)
 
 
+def test_ports_survive_kubernetes_service_link_injection(monkeypatch):
+    """k8s 가 같은 이름의 Service 링크(WEAVIATE_GRPC_PORT=tcp://ip:port)를 주입해도 포트 숫자를 읽는다 —
+    운영 코드서빙 800 에서 int('tcp://10.110.84.217:50051') 로 기동 실패했던 것(2026-10-23)."""
+    _no_dotenv(monkeypatch)
+    monkeypatch.setenv("WEAVIATE_GRPC_PORT", "tcp://10.110.84.217:50051")
+    monkeypatch.setenv("WEAVIATE_HTTP_PORT", "8080")
+    s = Settings.from_env()
+    assert s.weaviate_grpc_port == 50051 and s.weaviate_http_port == 8080
+    monkeypatch.setenv("WEAVIATE_GRPC_PORT", "garbage")
+    assert Settings.from_env().weaviate_grpc_port == 50051                 # 파싱 불가 → 기본값
+
+
 def test_settings_reads_api_key_and_secure(monkeypatch):
     _no_dotenv(monkeypatch)
     monkeypatch.delenv("WEAVIATE_API_KEY", raising=False)

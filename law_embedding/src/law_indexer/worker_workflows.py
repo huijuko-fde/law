@@ -20,10 +20,16 @@ from typing import Optional
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
+from temporalio.exceptions import ApplicationError
+
+with workflow.unsafe.imports_passed_through():
+    from .ingest_rules import HALT, decide        # 순수 함수 — sandbox 재import 불필요
 
 # activity 등록 이름 — 워크플로는 이 문자열로 activity 를 호출(모듈 import 결합 회피).
 INITIAL_INDEX_ACTIVITY = "law_embedding_initial_index"
 CONSUME_PACKAGE_ACTIVITY = "law_embedding_consume_package"
+CONVERT_INBOX_ACTIVITY = "law_embedding_convert_inbox"
+CONSUME_ZIP_ACTIVITY = "law_embedding_consume_zip"
 
 
 @dataclass
@@ -57,6 +63,21 @@ class PackageRequest:
     source: Optional[str] = None         # None 이면 package_header 로 자동 결정(1세대는 필수)
 
 
+@dataclass
+class LawInboxRequest:
+    """수신 폴더(LAW_ROOT) 한 번 처리 요청 — 변환 → consume-zip → 판정 (LAW-28).
+
+    Schedule 의 action 에 담기고, 수신 즉시 실행(trigger)도 같은 요청으로 돈다."""
+
+    root: str                            # LAW_ROOT (NFS). 그 밑에 done/ failed/ converted/ 가 있다
+    halt_on_partial: bool = True         # 부분 완료도 멈춤 사유(2026-10-22 정책)
+    allow_older_version: bool = False    # 수동 복구 전용 — 자동 경로는 항상 False
+    max_sweeps: int = 5                  # 일시장애 대기(waiting) 때 재소비 상한(_MAX_CONSUME_ATTEMPTS 와 맞춤)
+    sweep_wait_min: int = 15
+    manifest_grace_sec: int = 3600       # manifest 없이 이 시간 넘게 놓인 ZIP 은 멈춤 사유(변환 activity 가 보고)
+    retention_days: int = 30             # 적재가 끝난 산출물 보존 일수(소비 activity 끝에 정리). 0 = 영구
+
+
 # 생존신호가 이 시간 동안 안 오면 워커가 죽은 것으로 보고 즉시 재시도한다.
 # activity 쪽 heartbeat 주기는 30초(heartbeat.INTERVAL) — 그 10배로 잡아 일시적 지연·GC 로
 # 인한 오발동(정상 activity 취소)을 피하면서, 크래시 복구는 start_to_close(6~24시간)가 아니라
@@ -88,6 +109,46 @@ class ConsumePackageWorkflow:
     async def run(self, req: PackageRequest) -> dict:
         return await workflow.execute_activity(
             CONSUME_PACKAGE_ACTIVITY, req,
+            start_to_close_timeout=timedelta(hours=6),
+            **_HB,
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
+
+
+@workflow.defn
+class LawInboxWorkflow:
+    """수신 폴더 처리(LAW-28) — 변환과 소비를 activity 둘로 나눈다.
+
+    변환은 짧고 결정적 실패 위주(재시도 2회), 소비는 길고 일시장애를 .attempts 로 세므로(재시도 3회)
+    성격이 달라 한 activity 로 묶지 않는다. 소비가 waiting(재시도 대기) 이면 잠시 자고 다시 소비한다.
+    멈춤 사유가 있으면 non-retryable ApplicationError 로 실패한다 — Schedule(pause_on_failure) 이
+    일시정지되고, 결과 dict 는 details 에 실려 상태 조회·Temporal UI 에서 보인다."""
+
+    @workflow.run
+    async def run(self, req: LawInboxRequest) -> dict:
+        reports = await workflow.execute_activity(
+            CONVERT_INBOX_ACTIVITY, req,
+            start_to_close_timeout=timedelta(hours=1),
+            **_HB,
+            retry_policy=RetryPolicy(maximum_attempts=2),
+        )
+        summary = await self._consume(req)
+        sweeps = 1
+        while (summary.get("waiting") or summary.get("deferred")) and sweeps < req.max_sweeps:
+            await workflow.sleep(timedelta(minutes=req.sweep_wait_min))
+            summary = await self._consume(req)
+            sweeps += 1
+        verdict, reasons = decide(reports, summary, halt_on_partial=req.halt_on_partial)
+        result = {"convert": reports, "consume": summary, "verdict": verdict, "reasons": reasons,
+                  "sweeps": sweeps}
+        if verdict == HALT:
+            raise ApplicationError("; ".join(reasons), result, type="LawInboxHalt", non_retryable=True)
+        return result
+
+    @staticmethod
+    async def _consume(req: LawInboxRequest) -> dict:
+        return await workflow.execute_activity(
+            CONSUME_ZIP_ACTIVITY, req,
             start_to_close_timeout=timedelta(hours=6),
             **_HB,
             retry_policy=RetryPolicy(maximum_attempts=3),
