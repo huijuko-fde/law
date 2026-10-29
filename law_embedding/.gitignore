@@ -1,0 +1,10 @@
+# 소비 폴더 — 수집기가 떨군 package 와 그 처리 흔적. 코드가 아니다.
+#   data/ 자체는 남겨야 consume-folder 가 바로 돈다(빈 폴더는 git 이 추적하지 않으므로
+#   .gitkeep 를 두거나 실행 전에 mkdir 한다).
+data/*.jsonl
+data/*.jsonl.tmp
+data/*.processing
+data/*.attempts
+data/processed/
+data/failed/
+data/nack/

@@ -9,3 +9,9 @@ __pycache__/
 weaviate_data/
 *.egg-info/
 output/
+
+# 수동 배포 산출물·스냅샷·중첩 git 백업 — 코드가 아니다
+/law_embedding.zip
+/law_embedding-upload.tar.gz
+/_snapshot_*/
+/_nested_git_*.bundle
