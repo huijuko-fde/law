@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import shutil
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional
@@ -17,7 +18,7 @@ from .package import (_RoutedStores, consume_package, is_package_file,
                       peek_package_law_ids, peek_package_source)
 from .preprocess import (
     ATTACHMENT_SUFFIXES, DocParserClient, DocParserError, appendix_local_path,
-    is_permanent_parser_error,
+    extract_zip_members, is_permanent_parser_error,
     document_is_file_only, file_sha256, find_parent_law, find_pending_appendices,
     preprocess_file, resolve_article_images, resolve_pending_document_files, run_doc_parser,
 )
@@ -187,19 +188,33 @@ def index_attachment_files(store: WeaviateStore, embedder: LocalEmbedder, path: 
             settings.doc_parser_endpoint_path, settings.doc_parser_api_key, settings.doc_parser_upload,
             image_base_url=settings.doc_parser_image_base_url)
 
+    def run_preprocessor(target: Path, parent) -> dict:
+        if doc_parser is None:
+            return preprocessor(target, parent)
+        return preprocessor(
+            target, parent, client=doc_parser,
+            chunk_size=settings.doc_parser_chunk_size,
+            chunk_overlap=settings.doc_parser_chunk_overlap,
+            shared_dir=settings.doc_parser_shared_host_dir,
+            shared_container_dir=settings.doc_parser_shared_container_dir,
+            keep_temp_files=settings.doc_parser_keep_temp_files,
+            image_endpoint_path=settings.doc_parser_image_endpoint_path)
+
     def load(file_path: Path) -> List[LegalProvision]:
         parent = find_parent_law(file_path)
-        if doc_parser is not None:
-            data = preprocessor(
-                file_path, parent, client=doc_parser,
-                chunk_size=settings.doc_parser_chunk_size,
-                chunk_overlap=settings.doc_parser_chunk_overlap,
-                shared_dir=settings.doc_parser_shared_host_dir,
-                shared_container_dir=settings.doc_parser_shared_container_dir,
-                keep_temp_files=settings.doc_parser_keep_temp_files)
-        else:
-            data = preprocessor(file_path, parent)
-        return map_attachment_data(data, file_path)
+        if file_path.suffix.lower() != ".zip":
+            return map_attachment_data(run_preprocessor(file_path, parent), file_path)
+        # 첨부가 ZIP 이면 풀어서 내용물을 각각 적재한다(전처리기는 아카이브를 못 읽는다).
+        # 임시 디렉터리에 풀어 원본 데이터 트리를 건드리지 않고, git_path 는 ZIP 원본으로 남긴다.
+        provisions: List[LegalProvision] = []
+        with tempfile.TemporaryDirectory(prefix="law_zip_") as tmp:
+            for member in extract_zip_members(file_path, Path(tmp)):
+                data = run_preprocessor(member, parent)
+                data["file_name"] = member.name          # file_id 가 파일명 기반이라 멤버별로 갈려야 한다
+                data["unit_title"] = member.stem
+                data["source_file_path"] = f"{file_path}!/{member.name}"
+                provisions.extend(map_attachment_data(data, file_path))
+        return provisions
 
     return _run(store, embedder, sources, load, collection)
 

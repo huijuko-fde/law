@@ -34,7 +34,8 @@ from typing import Iterator, List, Optional, Tuple
 
 from .config import Settings
 from .pipeline import consume_folder
-from .zip_intake import Issue, ZipIntakeError, ZipIntakeResult, read_zip, write_packages
+from .zip_intake import (Issue, ZipIntakeError, ZipIntakeResult, flatten_nested_zips,
+                         read_zip, write_packages)
 
 DONE, PARTIAL, FAILED = "done", "partial", "failed"
 CONVERTING, LOADING = "converting", "loading"
@@ -157,8 +158,22 @@ def _convert(run: _Run, zip_path: Path, sha256: str, previous: Optional[dict]) -
             issues += _check_manifest_file(manifest, zip_path, sha256)
     if _errors(issues):
         return _fail(record, issues, _errors(issues)[0].code)
+    # 첨부가 ZIP 이면(법령 사이트가 별표 묶음을 ZIP 으로 준다) _scan_members 가
+    # unsupported_extension 으로 거부해 내용물이 통째로 유실된다. read_zip 에 넘기기 전에 펼친다.
+    # manifest 대조·sha256 은 위에서 원본 기준으로 끝났고, 펼친 ZIP 은 work 안에 둬서
+    # _publish 의 rmtree 가 함께 치운다.
+    source_zip = zip_path
     try:
-        result = read_zip(zip_path, manifest=manifest)
+        flattened = flatten_nested_zips(zip_path, work / "flattened.zip")
+        if flattened is not None:
+            source_zip = flattened
+            issues.append(Issue("warning", "nested_zip_flattened",
+                                "첨부 ZIP 을 펼쳐 내용물을 적재 대상에 포함했습니다", path=zip_path.name))
+    except Exception as exc:                            # 펼치기 실패는 치명적이지 않다 — 원본으로 간다
+        issues.append(Issue("warning", "nested_zip_flatten_failed",
+                            f"첨부 ZIP 펼치기 실패, 원본으로 진행합니다: {exc}", path=zip_path.name))
+    try:
+        result = read_zip(source_zip, manifest=manifest)
     except ZipIntakeError as exc:
         return _fail(record, issues + [Issue("error", "zip_corrupt", str(exc), path=zip_path.name)], "zip_corrupt")
     mismatches = _check_manifest_counts(manifest, result) if manifest is not None else []

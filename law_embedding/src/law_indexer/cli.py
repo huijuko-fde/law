@@ -10,6 +10,7 @@ from .embedder import make_embedder
 from .law_scope import load_law_scope
 from .mapper import load_attachment_json
 from .package import peek_package_source
+from .preprocess import sweep_staged_files
 from .pipeline import (consume_folder, find_preprocess_targets, index_attachment_files,
                        index_changeset, index_documents, index_paths)
 from .weaviate_store import WeaviateStore
@@ -332,6 +333,11 @@ def main(argv=None):
             return
 
         if args.command in INDEX_COMMANDS:
+            # 이전 실행이 SIGKILL 등으로 중단되며 남긴 staged 고아를 회수한다(24시간 경과분만).
+            orphans = sweep_staged_files(settings.doc_parser_shared_host_dir,
+                                         settings.doc_parser_keep_temp_files)
+            if orphans:
+                print(f"[sweep] staged 고아 {orphans}건 정리", file=sys.stderr)
             embedder = _embedder(settings)
 
             if args.command == "index":

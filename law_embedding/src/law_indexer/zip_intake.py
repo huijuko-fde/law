@@ -22,6 +22,7 @@ ZIP 옆 manifest(내부 수집기 zipbatch 형식)를 read_zip 에 주면, zipba
 """
 import base64
 import hashlib
+import io
 import json
 import os
 import re
@@ -42,6 +43,7 @@ from .package import ARTICLE_IMAGE, DELETE, DOCUMENT, FILE, FOOTER, HEADER, PEND
 from .preprocess import (
     SUPPORTED_DOC_PARSER_SUFFIXES, _FORMAT_DEDUP_PRIORITY, _appendix_label, _doc_family,
     _doc_kind_of, _ext_of, _pick_file, _safe_name, document_is_file_only, find_pending_appendices,
+    fit_staged_name,
 )
 
 # 수집기 zipbatch._ALLOWED(DMZ)와 같은 첨부 확장자 = preprocess.ATTACHMENT_SUFFIXES 에서 zip 을 뺀 것.
@@ -237,6 +239,106 @@ def _original_name(name: str, meta: dict) -> str:
     if match and isinstance(sha256, str) and sha256[:12].lower() == match.group("sha"):
         return match.group("stem") + match.group("ext")
     return name
+
+
+_MAX_NESTED_ZIP_DEPTH = 3
+
+
+def _nested_target(folder: str, name: str, taken: Set[str]) -> str:
+    """펼친 멤버가 같은 디렉터리에서 겹치지 않는 경로. 파일명 255바이트 제한도 여기서 지킨다."""
+    name = fit_staged_name(name)
+    stem, suffix = PurePosixPath(name).stem, PurePosixPath(name).suffix
+    candidate, seq = name, 0
+    while (f"{folder}/{candidate}" if folder else candidate) in taken:
+        seq += 1
+        candidate = fit_staged_name(f"{stem}_{seq}{suffix}")
+    path = f"{folder}/{candidate}" if folder else candidate
+    taken.add(path)
+    return path
+
+
+def _expand_nested(blob: bytes, folder: str, stem: str, writer: zipfile.ZipFile,
+                   taken: Set[str], depth: int) -> int:
+    """중첩 ZIP 바이트를 열어 멤버를 writer 에 평탄하게 쓴다. 쓴 개수를 돌려준다."""
+    if depth > _MAX_NESTED_ZIP_DEPTH:
+        return 0
+    written = 0
+    with zipfile.ZipFile(io.BytesIO(blob)) as inner:
+        for info in inner.infolist():
+            if info.is_dir():
+                continue
+            name, problem = _member_path(info)
+            if problem:                                  # 인코딩 불명·절대경로·zip slip
+                continue
+            parts = name.split("/")
+            base = parts[-1]
+            if not base or parts[0] in _OS_JUNK_DIRS or base in _OS_JUNK_NAMES:
+                continue
+            suffix = PurePosixPath(base).suffix.lower()
+            if suffix == ".json":
+                # 첨부 ZIP 안의 JSON 은 문서가 아니다. 넣으면 _scan_members 가 문서로 오인해
+                # manifest 문서 수 대조가 틀어진다.
+                continue
+            if suffix == ".zip":
+                written += _expand_nested(inner.read(info), folder,
+                                          f"{stem}__{PurePosixPath(base).stem}", writer,
+                                          taken, depth + 1)
+                continue
+            writer.writestr(_nested_target(folder, f"{stem}__{base}", taken), inner.read(info))
+            written += 1
+    return written
+
+
+def flatten_nested_zips(zip_path: Path, out_path: Path) -> Optional[Path]:
+    """배달 ZIP 안의 **첨부 ZIP** 을 풀어 같은 디렉터리에 평탄화한 새 ZIP 을 만든다.
+
+    법령 사이트가 별표 묶음을 ZIP 으로 주는 경우가 있다(운영 실측: admrul 6건 안에 hwp/hwpx
+    28건, 2단 중첩 2건 포함). `_scan_members` 는 `.zip` 멤버를 unsupported_extension 으로
+    거부하므로 그대로 두면 내용물이 통째로 유실된다.
+
+    zip_intake 는 멤버를 **원본 ZIP 안의 경로 문자열**로 식별하고 `iter_package_records` 가
+    ZIP 을 다시 열어 `getinfo` 로 찾는다. 중첩 멤버는 그 체계에 끼워 넣을 수 없어서, 대신
+    `read_zip` 에 넘기기 전에 펼쳐 평탄한 ZIP 하나로 만든다 — zip_intake 본체는 그대로 둔다.
+
+        법령명/첨부파일/전문.zip 안의 `[별지 1] 평가서.hwp`
+          → 법령명/첨부파일/전문__[별지 1] 평가서.hwp
+
+    같은 디렉터리에 두므로 "가장 가까운 상위 폴더의 문서에 연결" 규칙이 유지된다. 첨부 ZIP 안의
+    `.json` 은 문서가 아니라 제외한다(넣으면 문서 수 대조가 틀어진다).
+
+    중첩 ZIP 이 없으면 None — 원본을 그대로 쓰라는 뜻이고 추가 I/O 가 없다. 못 읽는 중첩 ZIP 은
+    원래 `.zip` 멤버를 그 자리에 남겨 `_scan_members` 가 평소대로 오류로 보고하게 둔다."""
+    with zipfile.ZipFile(zip_path) as archive:
+        nested = []
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            name, problem = _member_path(info)
+            if not problem and PurePosixPath(name).suffix.lower() == ".zip":
+                nested.append((info, name))
+        if not nested:
+            return None
+        nested_ids = {info.filename for info, _ in nested}
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        taken: Set[str] = set()
+        with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as writer:
+            for info in archive.infolist():              # 중첩이 아닌 멤버는 그대로 옮긴다
+                if info.is_dir() or info.filename in nested_ids:
+                    continue
+                name, problem = _member_path(info)
+                if problem:                              # 원본 그대로 남겨 _scan_members 가 보고하게 둔다
+                    writer.writestr(info.filename, archive.read(info))
+                    continue
+                taken.add(name)
+                writer.writestr(name, archive.read(info))
+            for info, name in nested:                    # 중첩 ZIP 은 그 자리에 풀어 넣는다
+                folder = name.rsplit("/", 1)[0] if "/" in name else ""
+                blob = archive.read(info)
+                try:
+                    _expand_nested(blob, folder, PurePosixPath(name).stem, writer, taken, 1)
+                except _READ_ERRORS:
+                    writer.writestr(name, blob)          # 못 풀면 원래 멤버를 남긴다
+    return out_path
 
 
 def _member_path(info: zipfile.ZipInfo) -> Tuple[str, Optional[Tuple[str, str]]]:

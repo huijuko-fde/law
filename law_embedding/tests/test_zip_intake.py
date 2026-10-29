@@ -19,7 +19,8 @@ from law_indexer.config import Settings
 from law_indexer.package import (
     consume_package, is_package_file, peek_package_law_ids, peek_package_source,
 )
-from law_indexer.zip_intake import ZipIntakeError, read_zip, write_packages
+from law_indexer.zip_intake import (ZipIntakeError, flatten_nested_zips, read_zip,
+                                    write_packages)
 
 
 # ── fake (test_package.py 와 같은 것) ────────────────────────────────────
@@ -673,3 +674,95 @@ def test_file_only_document_attachments_and_unsupported_format(tmp_path):
         ("file", "원문 규칙.hwp", "DOCUMENT_FILE"),
         ("pending_attachment", "참고.doc", "DOCUMENT_FILE")]
     assert body[1]["reason"] == "unsupported_file_extension:doc"
+
+
+# ── 첨부 ZIP 펼치기 (LAW-44) ─────────────────────────────────────────────
+#
+# 법령 사이트가 별표 묶음을 ZIP 으로 주면 _scan_members 가 unsupported_extension 으로 거부해
+# 내용물이 통째로 유실된다. read_zip 전에 펼쳐서 평탄한 ZIP 으로 바꾼다.
+
+def _zip_bytes(entries):
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        for name, payload in entries.items():
+            archive.writestr(name, payload)
+    return buf.getvalue()
+
+
+def test_flatten_returns_none_without_nested_zip(tmp_path):
+    """중첩 ZIP 이 없으면 None — 원본을 그대로 쓰고 파일도 만들지 않는다(추가 I/O 0)."""
+    src = tmp_path / "plain.zip"
+    src.write_bytes(_zip_bytes({"admrul/법령/법령.json": "{}"}))
+    out = tmp_path / "work" / "flattened.zip"
+    assert flatten_nested_zips(src, out) is None
+    assert not out.exists()
+
+
+def test_flatten_expands_nested_zip_in_place(tmp_path):
+    """첨부 ZIP 은 그 자리(같은 디렉터리)에 평탄 추출된다 — 상위 폴더 문서 연결이 유지돼야 한다."""
+    inner = _zip_bytes({
+        "분류센터 운영지침 (법무부예규).hwp": b"a",
+        "하위폴더/분류센터 운영지침 개정(전문).hwp": b"b",
+    })
+    src = tmp_path / "배달.zip"
+    src.write_bytes(_zip_bytes({
+        "admrul/분류센터 운영지침/분류센터 운영지침.json": json.dumps({"law_id": "X"}),
+        "admrul/분류센터 운영지침/첨부파일/전문.zip": inner,
+        "admrul/분류센터 운영지침/별표/별표1.hwp": b"plain",
+    }))
+    out = flatten_nested_zips(src, tmp_path / "work" / "flattened.zip")
+    with zipfile.ZipFile(out) as archive:
+        names = set(archive.namelist())
+    assert not any(n.endswith(".zip") for n in names)              # 껍데기는 남지 않는다
+    assert "admrul/분류센터 운영지침/분류센터 운영지침.json" in names
+    assert "admrul/분류센터 운영지침/별표/별표1.hwp" in names        # 무관한 멤버는 그대로
+    assert "admrul/분류센터 운영지침/첨부파일/전문__분류센터 운영지침 (법무부예규).hwp" in names
+    # ZIP 안의 디렉터리는 평탄화된다 — 접두가 붙어 출처를 알 수 있다
+    assert "admrul/분류센터 운영지침/첨부파일/전문__분류센터 운영지침 개정(전문).hwp" in names
+
+
+def test_flatten_recurses_into_doubly_nested_zip(tmp_path):
+    """ZIP 안의 ZIP 안의 파일까지 꺼낸다(운영 실측: 분류센터·분류처우 2건이 2단)."""
+    deep = _zip_bytes({"[별지 1] 수형자 다면적 평가서.hwp": b"deep"})
+    inner = _zip_bytes({"지침.hwp": b"a", "별지 양식.zip": deep})
+    src = tmp_path / "배달.zip"
+    src.write_bytes(_zip_bytes({"admrul/지침/첨부파일/전문.zip": inner}))
+    out = flatten_nested_zips(src, tmp_path / "work" / "flattened.zip")
+    with zipfile.ZipFile(out) as archive:
+        names = set(archive.namelist())
+    assert "admrul/지침/첨부파일/전문__별지 양식__[별지 1] 수형자 다면적 평가서.hwp" in names
+
+
+def test_flatten_drops_json_inside_attachment_zip(tmp_path):
+    """첨부 ZIP 안의 JSON 은 문서가 아니다 — 넣으면 문서 수 대조(manifest)가 틀어진다."""
+    inner = _zip_bytes({"지침.hwp": b"a", "meta.json": b'{"not": "a document"}'})
+    src = tmp_path / "배달.zip"
+    src.write_bytes(_zip_bytes({"admrul/지침/첨부파일/전문.zip": inner}))
+    out = flatten_nested_zips(src, tmp_path / "work" / "flattened.zip")
+    with zipfile.ZipFile(out) as archive:
+        names = set(archive.namelist())
+    assert not any(n.endswith(".json") for n in names)
+    assert "admrul/지침/첨부파일/전문__지침.hwp" in names
+
+
+def test_flatten_keeps_unreadable_nested_zip_as_member(tmp_path):
+    """못 푸는 중첩 ZIP 은 원래 멤버로 남긴다 — _scan_members 가 평소대로 오류로 보고하게."""
+    src = tmp_path / "배달.zip"
+    src.write_bytes(_zip_bytes({"admrul/지침/첨부파일/깨진.zip": b"not a zip at all"}))
+    out = flatten_nested_zips(src, tmp_path / "work" / "flattened.zip")
+    with zipfile.ZipFile(out) as archive:
+        assert "admrul/지침/첨부파일/깨진.zip" in set(archive.namelist())
+
+
+def test_flatten_avoids_name_collision(tmp_path):
+    """서로 다른 첨부 ZIP 이 같은 이름을 담아도 덮어쓰지 않는다(file_id 가 파일명 기반)."""
+    payload = _zip_bytes({"전문.hwp": b"x"})
+    src = tmp_path / "배달.zip"
+    src.write_bytes(_zip_bytes({
+        "admrul/지침/첨부파일/a.zip": payload,
+        "admrul/지침/첨부파일/b.zip": payload,
+    }))
+    out = flatten_nested_zips(src, tmp_path / "work" / "flattened.zip")
+    with zipfile.ZipFile(out) as archive:
+        names = [n for n in archive.namelist() if n.endswith(".hwp")]
+    assert len(names) == 2 and len(set(names)) == 2

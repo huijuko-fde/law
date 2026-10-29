@@ -20,7 +20,8 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from pathlib import Path
+import zipfile
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from .config import Settings
@@ -837,6 +838,71 @@ def cleanup_converted_image(converted_path: Optional[Path]) -> None:
         pass
 
 
+# 리눅스 파일명은 컴포넌트당 255바이트. staging 시 uuid4().hex(32) + "_" 가 앞에 붙으므로
+# 원본 이름에 쓸 수 있는 건 222바이트다(한글은 UTF-8 3바이트라 74자면 찬다).
+_STAGED_NAME_BUDGET = 255 - 33
+
+
+def fit_staged_name(name: str, budget: int = _STAGED_NAME_BUDGET) -> str:
+    """파일명이 255바이트 제한을 넘지 않게 stem 만 줄인다(확장자는 타입 판정에 쓰이므로 보존)."""
+    suffix = Path(name).suffix
+    stem = name[: len(name) - len(suffix)] if suffix else name
+    room = max(budget - len(suffix.encode()), 0)
+    encoded = stem.encode()
+    if len(encoded) <= room:
+        return name
+    return encoded[:room].decode(errors="ignore") + suffix
+
+
+_MAX_ZIP_DEPTH = 3
+
+
+def _zip_member_name(info: zipfile.ZipInfo) -> Optional[str]:
+    """ZIP 엔트리명 → 평탄화된 파일명. CP949 복원 + 경로조각 제거."""
+    name = info.filename
+    if not info.flag_bits & 0x800:          # UTF-8 플래그 없음 = 공공기관 ZIP 의 CP949
+        try:
+            name = name.encode("cp437").decode("cp949")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+    name = PurePosixPath(name.replace("\\", "/")).name   # 디렉터리·zip slip(..) 제거
+    return name or None
+
+
+def extract_zip_members(zip_path: Path, dest_dir: Path, depth: int = 0) -> List[Path]:
+    """첨부 ZIP 을 dest_dir 로 평탄 추출한다(중첩 ZIP 재귀). 전처리 가능한 확장자만 남긴다.
+
+    ZipFile.extract 를 쓰지 않는다 — 이름을 직접 정해야 CP949 복원·zip slip·255바이트 초과를
+    한자리에서 막을 수 있다. 중첩 ZIP 은 꺼내서 다시 풀고 껍데기는 버린다."""
+    extracted: List[Path] = []
+    if depth >= _MAX_ZIP_DEPTH:
+        return extracted
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as archive:
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            name = _zip_member_name(info)
+            if name is None:
+                continue
+            suffix = Path(name).suffix.lower()
+            if suffix != ".zip" and suffix not in SUPPORTED_DOC_PARSER_SUFFIXES:
+                continue
+            target = dest_dir / fit_staged_name(name)
+            seq = 0
+            while target.exists():          # file_id 는 파일명 기반이라 평탄화 충돌을 막아야 한다
+                seq += 1
+                target = dest_dir / fit_staged_name(f"{Path(name).stem}_{seq}{suffix}")
+            with archive.open(info) as src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            if suffix == ".zip":
+                extracted.extend(extract_zip_members(target, dest_dir, depth + 1))
+                target.unlink(missing_ok=True)
+            else:
+                extracted.append(target)
+    return extracted
+
+
 def stage_for_doc_parser(local_path: Path, host_dir: Optional[Path],
                          container_dir: Optional[str] = None) -> Tuple[Path, str, bool]:
     """전처리기 컨테이너가 접근 가능한 공유 디렉터리로 파일을 복사한다.
@@ -858,7 +924,7 @@ def stage_for_doc_parser(local_path: Path, host_dir: Optional[Path],
         return local_path, str(local_path), False
     host_dir = Path(host_dir)
     host_dir.mkdir(parents=True, exist_ok=True)
-    fname = f"{uuid.uuid4().hex}_{local_path.name}"
+    fname = f"{uuid.uuid4().hex}_{fit_staged_name(local_path.name)}"
     staged_host_path = host_dir / fname
     shutil.copy2(local_path, staged_host_path)
     request_path = f"{container_dir.rstrip('/')}/{fname}" if container_dir else str(staged_host_path)
@@ -866,12 +932,59 @@ def stage_for_doc_parser(local_path: Path, host_dir: Optional[Path],
 
 
 def cleanup_staged_file(staged_host_path: Path, was_staged: bool, keep: bool) -> None:
-    """staged 임시 파일을 호스트 경로 기준으로 정리한다. keep=True 면(디버깅용) 남긴다."""
-    if was_staged and not keep:
+    """staged 임시 파일을 호스트 경로 기준으로 정리한다. keep=True 면(디버깅용) 남긴다.
+
+    ⚠️ 2026-10-21 운영 전처리기로 확인: 전처리기가 staged 입력 **옆에** 같은 uuid 접두로
+    작업 폴더(`<uuid>_<stem>/`, 추출 이미지가 들어감)와 ASCII 치환 사본(`<uuid>_<한글제거>.pdf`)을
+    만든다. 입력 파일만 지우면 그 둘이 공유 디렉터리에 영구히 쌓인다(실측 346건).
+    uuid 는 이 stage 전용이라 같은 접두의 형제를 함께 지우는 것이 안전하다."""
+    if not was_staged or keep:
+        return
+    prefix = staged_host_path.name[:33]          # uuid4().hex(32) + "_"
+    try:
+        siblings = sorted(staged_host_path.parent.glob(f"{prefix}*"))
+    except OSError:
+        siblings = [staged_host_path]
+    for entry in siblings:
         try:
-            staged_host_path.unlink(missing_ok=True)
+            if entry.is_dir():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                entry.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+_STAGED_PREFIX_RE = re.compile(r"^[0-9a-f]{32}_")
+
+
+def sweep_staged_files(host_dir: Optional[Union[str, Path]], keep: bool,
+                       max_age_sec: int = 86400) -> int:
+    """이전 실행이 중단되며 남긴 staged 고아를 회수한다(우리 접두 + 충분히 오래된 것만).
+
+    정상 경로는 run_doc_parser 의 finally 가 지운다. 여기는 SIGKILL·OOM 처럼 finally 가
+    못 도는 경우만 받는다. 동시 실행 중인 다른 프로세스의 in-flight 파일을 건드리지 않도록
+    24시간 경과분만 지운다."""
+    if host_dir is None or keep:
+        return 0
+    root = Path(host_dir)
+    if not root.is_dir():
+        return 0
+    cutoff, removed = time.time() - max_age_sec, 0
+    for entry in root.iterdir():
+        if not _STAGED_PREFIX_RE.match(entry.name):
+            continue
+        try:
+            if entry.stat().st_mtime >= cutoff:
+                continue
+            if entry.is_dir():                   # 전처리기 작업 폴더도 같은 접두로 생긴다
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                entry.unlink(missing_ok=True)
+            removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def run_doc_parser(client: "DocParserClient", local_path: Path, chunk_size: int, chunk_overlap: int,
@@ -953,20 +1066,18 @@ def preprocess_file(file_path: Path, parent: Optional[Dict[str, Any]] = None, *,
                     client: Optional[DocParserClient] = None,
                     chunk_size: int = 2000, chunk_overlap: int = 200,
                     shared_dir: Optional[Path] = None, shared_container_dir: Optional[str] = None,
-                    keep_temp_files: bool = False) -> Dict[str, Any]:
+                    keep_temp_files: bool = False,
+                    image_endpoint_path: Optional[str] = None) -> Dict[str, Any]:
     """첨부파일 1건 → index-attachment-chunks 가 먹는 dict.
 
     client 를 주면 실제 Doc Parser 로 전처리하고, 없으면 목업 청크를 만든다.
     """
     parent = parent or {}
     if client is not None:
-        staged_host_path, request_path, was_staged = stage_for_doc_parser(
-            file_path, shared_dir, shared_container_dir)
-        try:
-            raw_chunks = client.run(request_path, chunk_size, chunk_overlap)
-        finally:
-            cleanup_staged_file(staged_host_path, was_staged, keep_temp_files)
-        chunks = normalize_doc_parser_chunks(raw_chunks)
+        # run_doc_parser 경유 — 이미지 PNG 변환과 적재용(intelligent) 엔드포인트 분기가 거기 있다.
+        chunks = run_doc_parser(client, file_path, chunk_size, chunk_overlap,
+                                shared_dir, shared_container_dir, keep_temp_files,
+                                image_endpoint_path=image_endpoint_path)
     else:
         chunks = _mock_chunks(file_path)
     return {
