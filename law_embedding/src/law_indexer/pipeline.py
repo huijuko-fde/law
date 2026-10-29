@@ -18,7 +18,7 @@ from .package import (_RoutedStores, consume_package, is_package_file,
                       peek_package_law_ids, peek_package_source)
 from .preprocess import (
     ATTACHMENT_SUFFIXES, DocParserClient, DocParserError, appendix_local_path,
-    extract_zip_members, is_permanent_parser_error,
+    extract_zip_members, is_permanent_parser_error, quality_stats, reset_quality,
     document_is_file_only, file_sha256, find_parent_law, find_pending_appendices,
     preprocess_file, resolve_article_images, resolve_pending_document_files, run_doc_parser,
 )
@@ -39,7 +39,46 @@ def _new_totals() -> dict:
         "images_success": 0, "images_failed": 0,
         "vectors_reused": 0,
         "errors": [],
+        "quality": {},
     }
+
+
+# 버린 청크가 이 비율을 넘으면 적재를 실패로 본다. 자동 필터가 오작동해도 티가 나지 않으므로
+# (2026-10-21: 표 패딩 판정이 조문 745건 = 본문의 2.4% 를 버릴 뻔했다) 조용한 손실을
+# 시끄러운 실패로 바꾼다. 임계는 운영 데이터로 조정한다.
+MAX_DROP_RATIO = 0.05
+
+
+def finish_quality(totals: dict, max_drop_ratio: float = MAX_DROP_RATIO) -> dict:
+    """품질 지표를 totals 에 싣고 가드를 건다. 임계를 넘으면 quality_guard 를 남긴다.
+
+    적재를 되돌리지는 않는다 — 이미 들어간 것을 지우면 더 위험하다. 대신 결과에 사유를
+    남기고 CLI 가 비정상 종료해 다음 단계(스케줄러·배포)가 진행되지 않게 한다."""
+    stats = quality_stats()
+    totals["quality"] = stats
+    # ① 내용이 있는 청크를 버렸다 — 필터 기준이 깨진 것이다. 비율과 무관하게 즉시 건다.
+    #    (2026-10-21 조문 745건은 본문의 2.4% 라 비율 가드로는 안 잡혔다)
+    leaked = stats.get("dropped_real_chars", 0)
+    if leaked:
+        totals["quality_guard"] = {
+            "reason": "dropped_chunks_had_content",
+            "dropped_real_chars": leaked,
+            "dropped": stats.get("chunks_dropped_empty", 0),
+            "message": f"버린 청크에 실질 문자 {leaked}자가 남아 있었습니다 — 빈 청크 판정이 "
+                       f"내용 있는 청크를 거르고 있습니다",
+        }
+        return totals
+    # ② 버린 양 자체가 과도하다 — 다른 종류의 오작동.
+    seen, dropped = stats.get("chunks_seen", 0), stats.get("chunks_dropped_empty", 0)
+    if seen and dropped / seen > max_drop_ratio:
+        totals["quality_guard"] = {
+            "reason": "chunks_dropped_ratio",
+            "dropped": dropped, "seen": seen,
+            "ratio": round(dropped / seen, 4), "limit": max_drop_ratio,
+            "message": f"빈 청크로 버린 비율이 {dropped/seen:.1%} 로 한계({max_drop_ratio:.0%})를 "
+                       f"넘었습니다 — 필터 오작동일 수 있어 적재를 실패로 처리합니다",
+        }
+    return totals
 
 
 def discover(path: Path, recursive: bool, limit: Optional[int],
@@ -142,6 +181,7 @@ def _embed_and_store(store: WeaviateStore, embedder: LocalEmbedder, objects: Lis
 def _run(store: WeaviateStore, embedder: LocalEmbedder, sources: List[Path],
          load: Callable[[Path], List[LegalProvision]], collection: str) -> dict:
     """공통 실행 루프: 소스마다 load → 임베딩 → upsert. 실패는 건너뛰고 계속."""
+    reset_quality()
     totals = _new_totals()
     for source in sources:
         try:
@@ -156,7 +196,7 @@ def _run(store: WeaviateStore, embedder: LocalEmbedder, sources: List[Path],
         except Exception as exc:
             totals["files_failed"] += 1
             totals["errors"].append({"file": str(source), "error": str(exc)})
-    return totals
+    return finish_quality(totals)
 
 
 def index_paths(store: WeaviateStore, embedder: LocalEmbedder, path: Path, collection: str,
@@ -672,6 +712,7 @@ def index_documents(store: WeaviateStore, embedder: LocalEmbedder, settings: Set
     if doc_source not in ("law", "admrul", "schlpub"):
         raise ValueError(f"doc_source 는 'law'/'admrul'/'schlpub' 중 하나여야 합니다: {doc_source!r}")
 
+    reset_quality()
     mapper_fn = map_law_data if doc_source == "law" else map_admrul_data
     collection = settings.collection_for(doc_source)
     # 첨부 전처리 스위치 — 끄면(또는 DOC_PARSER_BASE_URL 이 비면) 첨부를 **건너뛴다**.
@@ -916,7 +957,7 @@ def index_documents(store: WeaviateStore, embedder: LocalEmbedder, settings: Set
             logger.warning("[scope] 미매칭 부처(소관부처명에 없음): %s", ", ".join(miss_min))
 
     bulk.flush()
-    return totals
+    return finish_quality(totals)
 
 
 def find_preprocess_targets(path: Path, doc_source: str, recursive: bool = True,

@@ -275,6 +275,28 @@ def _run_sync(settings: Settings, sources: List[str]) -> bool:
     return ok
 
 
+def _exit_on_quality_guard(result) -> None:
+    """품질 가드가 걸렸으면 비정상 종료한다 — 조용한 손실을 시끄러운 실패로 바꾼다.
+
+    적재분을 되돌리지는 않는다(이미 들어간 것을 지우는 쪽이 더 위험하다). 종료 코드로
+    다음 단계(스케줄러·후속 배치)가 진행되지 않게 막는 것이 목적이다."""
+    guards = []
+    stack = [result]
+    while stack:                                   # by_source 로 감싸인 결과도 훑는다
+        item = stack.pop()
+        if isinstance(item, dict):
+            if "quality_guard" in item:
+                guards.append(item["quality_guard"])
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    if not guards:
+        return
+    for g in guards:
+        print(f"[품질 가드] {g.get('message')}", file=sys.stderr)
+    raise SystemExit(2)
+
+
 def main(argv=None):
     """CLI 입력을 해석해 health/sync/create/index/search 작업을 실행한다."""
     args = parser().parse_args(argv)
@@ -330,6 +352,7 @@ def main(argv=None):
                 print(f"[2단계] 전처리 켜고: index --source {args.source} --paths-file {args.out}",
                       file=sys.stderr)
             print(json.dumps(result, ensure_ascii=False, indent=2))
+            _exit_on_quality_guard(result)
             return
 
         if args.command in INDEX_COMMANDS:

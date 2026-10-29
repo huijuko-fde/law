@@ -11,6 +11,7 @@ Doc Parser API(GET /healthcheck, POST /run)를 호출한다. `preprocess_file`�
 temporal_law 코드에 의존하지 않는다(경계 유지, CLAUDE.md §1). 수집기 쪽 명명 규칙이 바뀌면
 이 부분도 같이 맞춰야 한다.
 """
+import collections
 import hashlib
 import json
 import re
@@ -851,6 +852,7 @@ def fit_staged_name(name: str, budget: int = _STAGED_NAME_BUDGET) -> str:
     encoded = stem.encode()
     if len(encoded) <= room:
         return name
+    note_quality("filenames_truncated")
     return encoded[:room].decode(errors="ignore") + suffix
 
 
@@ -900,6 +902,7 @@ def extract_zip_members(zip_path: Path, dest_dir: Path, depth: int = 0) -> List[
                 target.unlink(missing_ok=True)
             else:
                 extracted.append(target)
+                note_quality("zip_members_extracted")
     return extracted
 
 
@@ -984,6 +987,7 @@ def sweep_staged_files(host_dir: Optional[Union[str, Path]], keep: bool,
             removed += 1
         except OSError:
             continue
+    note_quality("staged_orphans_swept", removed)
     return removed
 
 
@@ -1017,13 +1021,84 @@ def run_doc_parser(client: "DocParserClient", local_path: Path, chunk_size: int,
     return normalize_doc_parser_chunks(raw_chunks)
 
 
+# 전처리기가 HWP 표를 마크다운으로 바꾸면서 셀 레이아웃을 공백으로 패딩한다. 신구 조문 대비표처럼
+# 빈 칸이 많은 표는 파이프와 공백만 2,400자씩 채운 청크가 수천 개 나온다 — 운영 실측(2026-10-21):
+# 42,617건 중 3,062건(7.2%·6.8MB)이 이것이고, 한 문서(수용자 의료관리지침 신구 조문 대비표)가
+# 2,316건이었다. 내용이 없어 임베딩도 검색도 의미가 없고, 개정마다 나오는 문서라 증분에서 반복된다.
+_TABLE_FILLER = re.compile(r"[\s|\-+_=~·.※□■◦○●\u00a0]")
+
+
+# ── 적재 품질 카운터 ────────────────────────────────────────────────────
+#
+# 자동 처리(패딩 압축·빈 청크 제거·파일명 절단·ZIP 해제)는 잘못돼도 티가 나지 않는다.
+# 2026-10-21 실측: 표 패딩 필터의 첫 판정이 공백에 묻힌 조문 745건을 버릴 뻔했고,
+# 샘플을 눈으로 보지 않았으면 조용히 사라졌을 것이다. 그래서 **무엇을 버리고 고쳤는지**를
+# 항상 세어 적재 결과에 싣는다. 세는 것만으로는 부족해 가드도 함께 건다(pipeline).
+#
+# 단일 프로세스 배치 경로에서만 쓰므로 모듈 수준 카운터로 충분하다.
+_QUALITY: "collections.Counter[str]" = collections.Counter()
+
+
+def reset_quality() -> None:
+    """적재 1회분 품질 카운터를 초기화한다(진입점에서 호출)."""
+    _QUALITY.clear()
+
+
+def quality_stats() -> Dict[str, int]:
+    """지금까지 집계된 품질 지표. 적재 결과 totals["quality"] 에 실린다."""
+    return dict(_QUALITY)
+
+
+def note_quality(key: str, count: int = 1) -> None:
+    """품질 지표 기록 — 자동 처리를 한 쪽이 직접 남긴다."""
+    if count:
+        _QUALITY[key] += count
+
+
+_TABLE_PADDING = re.compile(r"[ \t\u00a0]{3,}")
+
+
+def collapse_table_padding(text: str) -> str:
+    """표 셀 패딩을 압축한다 — 3칸 이상 연속 공백만 1칸으로, 내용은 그대로.
+
+    ⚠️ 이 압축 없이 길이 대비 비율로 거르면 **실제 조문을 버린다**. 운영 실측(2026-10-21):
+    비율 판정으로 걸러진 3,062건 중 745건이 공백에 묻힌 조문이었다 —
+    `| <신설> | 제14조의2(의료인 준수사항) ① 의무관은 …` 이 2,440자 중 2,280자가 패딩이라
+    실질 문자 비율 5%에 걸렸다. 압축하고 나서 판정해야 한다."""
+    squeezed = _TABLE_PADDING.sub(" ", text)
+    if len(squeezed) < len(text):
+        note_quality("chunks_padding_collapsed")
+    return squeezed
+
+
+def is_filler_chunk(text: str) -> bool:
+    """실질 문자(공백·표 장식 제외)가 **하나도** 없는 청크인가.
+
+    **압축된 텍스트**에 쓴다(collapse_table_padding 먼저). 기준을 0으로 두는 건
+    의도적이다 — 조문을 버리는 쪽이 쓰레기를 조금 남기는 쪽보다 훨씬 나쁘다.
+    '본문' 2글자나 표 안의 숫자 하나처럼 짧아도 문자가 있으면 남긴다."""
+    return not _TABLE_FILLER.sub("", text)
+
+
 def normalize_doc_parser_chunks(raw_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Doc Parser 원시 응답 청크를 첨부 매핑(map_attachment_data/build_attachment_provisions)이
-    기대하는 청크 형식으로 맞춘다. text가 비어있는 청크는 DocParserClient.run 에서 이미 제외됐다."""
+    기대하는 청크 형식으로 맞춘다. text가 비어있는 청크는 DocParserClient.run 에서 이미 제외됐고,
+    표 패딩만 남은 청크(is_filler_chunk)는 여기서 버린다.
+
+    chunk_index 는 원본 값을 그대로 둔다 — 버린 자리에 구멍이 생기지만, chunk_id 가 그 값으로
+    만들어지므로 재적재 때 같은 id 가 나와야 멱등이 유지된다."""
     normalized = []
+    note_quality("chunks_seen", len(raw_chunks))
     for chunk in raw_chunks:
+        text = collapse_table_padding(chunk.get("text", "") or "")
+        if is_filler_chunk(text):
+            note_quality("chunks_dropped_empty")
+            # 버린 것에 내용이 남아 있었는지 센다. 현재 판정(실질 문자 0)에서는 항상 0이어야
+            # 하고, 0 이 아니면 기준이 잘못된 것이다 — 비율 가드보다 민감하다.
+            note_quality("dropped_real_chars", len(_TABLE_FILLER.sub("", text)))
+            continue
         normalized.append({
-            "content": chunk.get("text", ""),
+            "content": text,
             "chunk_index": chunk.get("i_chunk_on_doc"),
             "page_no": chunk.get("i_page"),
             "start_page": chunk.get("i_page"),

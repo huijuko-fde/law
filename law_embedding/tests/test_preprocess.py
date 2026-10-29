@@ -10,7 +10,8 @@ from law_indexer.preprocess import (
     DocParserClient, DocParserError, appendix_local_path, attachment_local_path,
     body_has_meaningful_text, cleanup_staged_file, document_is_file_only, find_article_images,
     find_parent_law, find_pending_appendices, has_document_attachment,
-    is_deleted_appendix_content, normalize_doc_parser_chunks, preprocess_file,
+    collapse_table_padding, is_deleted_appendix_content, is_filler_chunk,
+    normalize_doc_parser_chunks, preprocess_file,
     resolve_pending_document_files, stage_for_doc_parser,
 )
 
@@ -520,3 +521,149 @@ def test_appendix_local_path_split_dir_ignores_other_document(tmp_path):
     other = {"law_id": "999", "law_name": "같은이름규정", "doc_target": "admrul", "doc_kind": "행정규칙"}
     ap = {"kind": "별표", "no": "1", "local_path": "별표/별표1_서식.hwp"}
     assert appendix_local_path(root, other, ap) is None
+
+
+# ── 표 패딩 압축 + 빈 표 거르기 (LAW-46) ────────────────────────────────
+#
+# 전처리기가 HWP 표를 마크다운으로 바꾸며 셀을 공백으로 패딩한다. 압축하지 않고 길이 대비
+# 비율로 거르면 공백에 묻힌 실제 조문까지 버린다 — 운영 실측에서 3,062건 중 745건이 조문이었다.
+
+_PADDED_ARTICLE = ("| <신설> | 제14조의2(의료인 준수사항) ① 의무관(간호사)은 수용자 의료정보"
+                   "시스템의 진료기록부에 환자의 주된 증상, 진단 및 치료 내용 등 의료행위에 관한 "
+                   "사항과 의견을 기록하여야 한다." + " " * 2280 + "|")
+
+
+def test_collapse_keeps_article_text_that_padding_hid():
+    """공백에 묻힌 조문은 압축 후 살아남아야 한다 — 이게 깨지면 조문을 버리게 된다."""
+    squeezed = collapse_table_padding(_PADDED_ARTICLE)
+    assert "제14조의2(의료인 준수사항)" in squeezed
+    assert len(squeezed) < 300                      # 2,440자 → 165자 수준
+    assert not is_filler_chunk(squeezed)
+
+
+def test_empty_table_grid_is_filler_after_collapse():
+    """파이프와 공백뿐인 격자는 압축하면 실질 문자가 남지 않는다."""
+    assert is_filler_chunk(collapse_table_padding("|" + " " * 2400))
+    assert is_filler_chunk(collapse_table_padding("|" + " " * 600 + "|" + " " * 600 + "|"))
+
+
+def test_form_field_labels_survive():
+    """빈 서식의 필드명도 내용이다 — 압축하면 검색 가능한 청크가 된다."""
+    raw = "| 접수증명원" + " " * 500 + "| 접수증명원" + " " * 700
+    squeezed = collapse_table_padding(raw)
+    assert "접수증명원" in squeezed
+    assert not is_filler_chunk(squeezed)
+
+
+def test_short_text_is_never_filler():
+    """짧아도 문자가 있으면 남긴다 — 조문을 버리는 쪽이 쓰레기를 남기는 쪽보다 나쁘다."""
+    assert not is_filler_chunk("본문")
+    assert not is_filler_chunk("| 1 |")
+    assert not is_filler_chunk("제5조")
+
+
+def test_normalize_collapses_and_drops_empty_keeping_index():
+    """압축본을 저장하고 빈 것만 버린다. chunk_index 는 원본 값을 유지해야 멱등이 깨지지 않는다."""
+    raw = [
+        {"text": "제1조 목적. 이 지침은 수용자 의료관리에 필요한 사항을 정한다.", "i_chunk_on_doc": 0},
+        {"text": "|" + " " * 2400, "i_chunk_on_doc": 1},
+        {"text": _PADDED_ARTICLE, "i_chunk_on_doc": 2},
+    ]
+    out = normalize_doc_parser_chunks(raw)
+    assert len(out) == 2
+    assert [c["chunk_index"] for c in out] == [0, 2]
+    assert "제14조의2(의료인 준수사항)" in out[1]["content"]
+    assert len(out[1]["content"]) < 300              # 압축본이 저장돼야 한다
+
+
+# ── 적재 품질 지표·가드 (LAW-48) ─────────────────────────────────────────
+#
+# 자동 처리는 잘못돼도 티가 나지 않는다. 2026-10-21 표 패딩 판정이 조문 745건을 버릴
+# 뻔했고 샘플을 눈으로 보지 않았으면 조용히 사라졌다. 무엇을 버리고 고쳤는지 항상 센다.
+
+def test_quality_counts_what_was_dropped_and_fixed():
+    """버린 청크와 압축한 청크가 숫자로 남아야 한다."""
+    from law_indexer.preprocess import reset_quality, quality_stats
+    reset_quality()
+    normalize_doc_parser_chunks([
+        {"text": "제1조 목적. 이 지침은 필요한 사항을 정한다.", "i_chunk_on_doc": 0},
+        {"text": "|" + " " * 2400, "i_chunk_on_doc": 1},          # 빈 표 → 버림
+        {"text": _PADDED_ARTICLE, "i_chunk_on_doc": 2},            # 패딩 → 압축
+    ])
+    q = quality_stats()
+    assert q["chunks_seen"] == 3
+    assert q["chunks_dropped_empty"] == 1
+    assert q["chunks_padding_collapsed"] >= 1
+
+
+def test_quality_counter_resets_per_run():
+    """진입점마다 초기화돼야 이전 실행 수치가 섞이지 않는다."""
+    from law_indexer.preprocess import reset_quality, quality_stats
+    reset_quality()
+    normalize_doc_parser_chunks([{"text": "|" + " " * 2400, "i_chunk_on_doc": 0}])
+    assert quality_stats()["chunks_dropped_empty"] == 1
+    reset_quality()
+    assert quality_stats() == {}
+
+
+def test_filename_truncation_is_counted():
+    """파일명을 잘랐으면 센다 — 메타데이터가 조용히 바뀌는 걸 막는다."""
+    from law_indexer.preprocess import reset_quality, quality_stats, fit_staged_name
+    reset_quality()
+    fit_staged_name("짧은이름.pdf")
+    assert "filenames_truncated" not in quality_stats()
+    fit_staged_name("가" * 200 + ".pdf")
+    assert quality_stats()["filenames_truncated"] == 1
+
+
+def test_guard_trips_when_too_many_chunks_dropped():
+    """버린 비율이 한계를 넘으면 quality_guard 가 남아야 한다 — 745건 사건의 재발 방지."""
+    from law_indexer.pipeline import finish_quality
+    from law_indexer.preprocess import reset_quality, note_quality
+    reset_quality()
+    note_quality("chunks_seen", 1000)
+    note_quality("chunks_dropped_empty", 100)          # 10% > 한계 5%
+    totals = finish_quality({})
+    assert "quality_guard" in totals
+    g = totals["quality_guard"]
+    assert g["ratio"] == 0.1 and g["dropped"] == 100 and g["seen"] == 1000
+
+
+def test_guard_silent_within_limit():
+    """정상 범위면 가드가 걸리지 않는다."""
+    from law_indexer.pipeline import finish_quality
+    from law_indexer.preprocess import reset_quality, note_quality
+    reset_quality()
+    note_quality("chunks_seen", 1000)
+    note_quality("chunks_dropped_empty", 10)           # 1% < 한계 5%
+    totals = finish_quality({})
+    assert "quality_guard" not in totals
+    assert totals["quality"]["chunks_dropped_empty"] == 10
+
+
+def test_guard_trips_when_dropped_chunk_had_content():
+    """내용이 있는 청크를 버리면 비율과 무관하게 즉시 걸려야 한다.
+
+    2026-10-21 조문 745건은 본문의 2.4% 라 비율 가드(5%)로는 안 잡혔다. 그 사건을
+    재현하는 가드다 — 판정 기준을 잘못 바꾸면 여기서 멈춘다."""
+    from law_indexer.pipeline import finish_quality
+    from law_indexer.preprocess import reset_quality, note_quality
+    reset_quality()
+    note_quality("chunks_seen", 31159)
+    note_quality("chunks_dropped_empty", 745)        # 2.4% — 비율 가드는 통과
+    note_quality("dropped_real_chars", 89000)        # 그런데 내용이 있었다
+    totals = finish_quality({})
+    assert totals["quality_guard"]["reason"] == "dropped_chunks_had_content"
+
+
+def test_real_filler_leaves_no_content_behind():
+    """실제 빈 표를 버릴 때는 dropped_real_chars 가 0 이어야 한다(가드 오작동 방지)."""
+    from law_indexer.preprocess import reset_quality, quality_stats
+    reset_quality()
+    normalize_doc_parser_chunks([
+        {"text": "|" + " " * 2400, "i_chunk_on_doc": 0},
+        {"text": "|" + " " * 600 + "|" + " " * 600 + "|", "i_chunk_on_doc": 1},
+    ])
+    q = quality_stats()
+    assert q["chunks_dropped_empty"] == 2
+    assert q.get("dropped_real_chars", 0) == 0

@@ -8,7 +8,7 @@ from .chunking import (
     MAX_CHAPTER_CTX_CHARS, clamp_search_prefix, max_content_chars, split_prose, split_table_like,
 )
 from .models import LegalProvision
-from .preprocess import is_deleted_appendix_content
+from .preprocess import collapse_table_padding, is_deleted_appendix_content
 
 
 class MappingError(ValueError):
@@ -317,7 +317,9 @@ def _make_json(data: Dict[str, Any], path: Path, unit: Dict[str, Any], unit_type
     hard_max_chars 로 넘겨 **content 조각이 반드시 그 안에 들어가게** 한다(chunking 참고).
     조각이 몇 개로 나뉘든 provision_id 는 그대로고 chunk_index/chunk_count 만 늘어난다."""
     common = _common(data, path, doc_source=doc_source, source_repository=source_repository)
-    content = str(unit.get("content") or "")
+    # 수집기 JSON 의 content 에도 표 패딩이 섞여 온다 — 첨부(normalize_doc_parser_chunks)와
+    # 같은 압축을 여기서도 건다. 운영 실측(2026-10-21): JSON 청크 5,485건이 패딩을 달고 있었다.
+    content = collapse_table_padding(str(unit.get("content") or ""))
     chapter = _text(unit.get("chapter")) if unit_type == "ARTICLE" else None
     # 임베딩 문맥은 **장 경로 전체**를 쓴다(있으면). `chapter` 는 가장 가까운 한 단계라
     #   "제2절 해고" 만 남아 어느 장 밑인지가 사라진다. 필드값은 종전대로 nearest 를 유지하고
@@ -391,7 +393,7 @@ def _combined_addendum_unit(addenda: Iterable[Any]) -> Optional[Dict[str, Any]]:
     for index, addendum in enumerate(addenda or [], start=1):
         if not isinstance(addendum, dict):
             continue
-        content = _text(addendum.get("content"))
+        content = _text(collapse_table_padding(str(addendum.get("content") or "")))
         if not content:
             continue
         labels = []
