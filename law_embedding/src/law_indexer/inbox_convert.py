@@ -15,15 +15,21 @@ build_admrul_payload 의 **관계 추출을 뺀** 부분만 옮겼다 — 관계
 manifest 는 **새로 쓴다**. 원본 manifest 의 sha256/bytes/files 는 원본 ZIP 기준이라 변환본에 그대로
 붙이면 zip_consume 이 manifest_mismatch 로 거부한다. docs(id·mst·dir)만 가져오고 나머지는 재계산.
 
-사용:  python -m law_indexer.inbox_convert <inbox_dir> <outbox_dir>
+변환은 결정적이고(같은 ZIP → 같은 바이트) 게시는 원자적이다(manifest 먼저, ZIP 은 .part → rename).
+한 ZIP 의 실패는 그 ZIP 만 failed 로 격리하고 아무것도 게시하지 않는다. convert_one 참고.
+
+사용:  python -m law_indexer.inbox_convert <inbox_dir> <outbox_dir> [--done DIR] [--failed DIR]
 """
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 import zipfile
+from datetime import datetime
 from pathlib import Path, PurePosixPath
+from typing import Optional
 
 from .lawgo_raw import admrul as _adm
 from .lawgo_raw import common as _c
@@ -58,8 +64,11 @@ def _stats(articles, addenda, appendices, attachments=None) -> dict:
     return d
 
 
-def assemble_law(body_json: dict, law_id: str, mst: str, law_name: str) -> dict:
-    """수집기 build_payload 의 관계 없는 조립. mst 는 본문 응답에 없어 manifest 로 받는다."""
+def assemble_law(body_json: dict, law_id: str, mst: str, law_name: str, at: str = "") -> dict:
+    """수집기 build_payload 의 관계 없는 조립. mst 는 본문 응답에 없어 manifest 로 받는다.
+
+    at 은 fetched_at/synced_at 에 쓸 시각 — 비우면 지금. 변환은 같은 입력에 같은 바이트를
+    내야 하므로(convert_zip 참고) 배달 ZIP 에서 뽑은 시각을 넘긴다."""
     fv = _c.first_value_recursive
     articles = _c.build_articles(body_json)
     addenda = _c.build_addenda(body_json)
@@ -105,16 +114,17 @@ def assemble_law(body_json: dict, law_id: str, mst: str, law_name: str) -> dict:
         "addenda": addenda, "appendices": appendices, "ordinance_delegations": [],
         "relation_mode": "no_crawl",
         "relation_stats": _stats(articles, addenda, appendices),
-        "source": {"source_url": _c.build_ref_url("법령", law_name), "fetched_at": _c.now_kst()},
-        "sync": {"sync_reason": "INITIAL_LOAD", "synced_at": _c.now_kst()},
+        "source": {"source_url": _c.build_ref_url("법령", law_name), "fetched_at": at or _c.now_kst()},
+        "sync": {"sync_reason": "INITIAL_LOAD", "synced_at": at or _c.now_kst()},
     }
     _c.attach_ref_ids(payload)                   # 조/별표/부칙 provision_id — 수집기와 같은 순서
     _law._enrich_file_meta(appendices, articles) # 별표/이미지에 filename·local_path
     return payload
 
 
-def assemble_admrul(body_json: dict, aid: str, seq: str, name: str, target: str = "admrul") -> dict:
-    """수집기 build_admrul_payload 의 관계 없는 조립."""
+def assemble_admrul(body_json: dict, aid: str, seq: str, name: str, target: str = "admrul",
+                    at: str = "") -> dict:
+    """수집기 build_admrul_payload 의 관계 없는 조립. at 은 assemble_law 와 같다."""
     fv = _c.first_value_recursive
     message = body_json.get("Law") if isinstance(body_json, dict) else None
     if isinstance(message, str) and "일치하는 행정규칙이 없습니다" in message:
@@ -157,19 +167,19 @@ def assemble_admrul(body_json: dict, aid: str, seq: str, name: str, target: str 
         "addenda": addenda, "appendices": appendices, "attachments": attachments, "ordinance_delegations": [],
         "relation_mode": "no_crawl",
         "relation_stats": _stats(articles, addenda, appendices, attachments),
-        "source": {"source_url": _c.build_ref_url(url_cat, canonical), "fetched_at": _c.now_kst()},
-        "sync": {"sync_reason": "INITIAL_LOAD", "synced_at": _c.now_kst()},
+        "source": {"source_url": _c.build_ref_url(url_cat, canonical), "fetched_at": at or _c.now_kst()},
+        "sync": {"sync_reason": "INITIAL_LOAD", "synced_at": at or _c.now_kst()},
     }
     _c.attach_ref_ids(payload)                   # 수집기와 같은 순서
     _c.enrich_file_meta(payload)                 # 별표·첨부·본문이미지에 filename/file_dir/local_path
     return payload
 
 
-def convert_payload(body_json: dict, doc: dict, source: str, name: str) -> dict:
+def convert_payload(body_json: dict, doc: dict, source: str, name: str, at: str = "") -> dict:
     """원본 body_json → 적재기 payload. doc 은 manifest docs[] 의 {id, mst, dir}."""
     if source == "law":
-        return assemble_law(body_json, doc.get("id") or "", doc.get("mst") or "", name)
-    return assemble_admrul(body_json, doc.get("id") or "", doc.get("mst") or "", name)
+        return assemble_law(body_json, doc.get("id") or "", doc.get("mst") or "", name, at=at)
+    return assemble_admrul(body_json, doc.get("id") or "", doc.get("mst") or "", name, at=at)
 
 
 def _member_names(archive: zipfile.ZipFile) -> list:
@@ -239,22 +249,43 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def write_manifest(zip_path: Path, docs: list, out: Path) -> dict:
-    """변환본 기준으로 manifest 를 다시 쓴다(docs 는 원본 것을 그대로)."""
+def write_manifest(zip_path: Path, docs: list, out: Path, *, file_name: str = "",
+                   source: Optional[dict] = None) -> dict:
+    """변환본 기준으로 manifest 를 다시 쓴다(docs 는 원본 것을 그대로).
+
+    file_name 은 manifest 에 적을 ZIP 이름 — 임시 이름(.part)으로 쓰는 중이면 최종 이름을 준다.
+    source 는 원본 배달 ZIP 의 {file, sha256} — 같은 원본을 다시 변환하지 않는 판단(convert_one)에 쓴다."""
     files = []
     with zipfile.ZipFile(zip_path) as z:
         for info in z.infolist():
             if not info.is_dir():
                 files.append({"path": info.filename, "sha256": hashlib.sha256(z.read(info)).hexdigest(),
                               "bytes": info.file_size})
-    mf = {"file": zip_path.name, "sha256": _sha256(zip_path), "bytes": zip_path.stat().st_size,
+    mf = {"file": file_name or zip_path.name, "sha256": _sha256(zip_path), "bytes": zip_path.stat().st_size,
           "documents": len(docs), "docs": docs, "files": files}
+    if source:
+        mf["source"] = source
     out.write_text(json.dumps(mf, ensure_ascii=False, indent=1), encoding="utf-8")
     return mf
 
 
+# 변환은 **결정적**이어야 한다 — 같은 배달 ZIP 이면 같은 바이트가 나와야 consume-zip 의 SHA-256
+# 중복 방지가 재변환본을 알아본다. 비결정 요소 둘을 입력에 묶는다: payload 의 fetched_at/synced_at
+# 은 배달 ZIP 멤버의 가장 늦은 타임스탬프로, 출력 멤버 타임스탬프는 원본 멤버 것으로.
+def _zip_clock(infos) -> str:
+    latest = max((i.date_time for i in infos if not i.is_dir()), default=(1980, 1, 1, 0, 0, 0))
+    return datetime(*latest, tzinfo=_c.KST).isoformat(timespec="seconds")
+
+
+def _entry(name: str, like: zipfile.ZipInfo) -> zipfile.ZipInfo:
+    info = zipfile.ZipInfo(name, date_time=like.date_time)
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.external_attr = 0o644 << 16
+    return info
+
+
 def convert_zip(zip_path: Path, manifest: dict, out_zip: Path) -> dict:
-    """배달 ZIP 1건 변환. 반환: 보고 dict(문서·rename·drop·오류)."""
+    """배달 ZIP 1건 변환. 반환: 보고 dict(문서·rename·drop·오류). 같은 입력이면 같은 바이트를 쓴다."""
     docs_by_dir = {d["dir"]: d for d in manifest.get("docs") or []}
     report = {"zip": zip_path.name, "documents": 0, "renamed": 0, "dropped": 0, "kept": 0,
               "errors": [], "payloads": []}
@@ -262,6 +293,7 @@ def convert_zip(zip_path: Path, manifest: dict, out_zip: Path) -> dict:
     with zipfile.ZipFile(zip_path) as src, zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as dst:
         members = _member_names(src)
         by_name = {name: raw for raw, name in members}
+        at = _zip_clock(src.infolist())
         for jpath in [n for _, n in members if n.endswith(".json")]:
             folder = jpath.rsplit("/", 1)[0] if "/" in jpath else ""
             doc = docs_by_dir.get(folder)
@@ -274,11 +306,11 @@ def convert_zip(zip_path: Path, manifest: dict, out_zip: Path) -> dict:
                 continue
             try:
                 body_json = json.loads(src.read(by_name[jpath]).decode("utf-8-sig"))
-                payload = convert_payload(body_json, doc, source, PurePosixPath(jpath).stem)
-            except Exception as exc:                 # 한 문서가 깨져도 나머지는 변환한다
+                payload = convert_payload(body_json, doc, source, PurePosixPath(jpath).stem, at=at)
+            except Exception as exc:                 # 한 문서가 깨져도 나머지는 변환해 보고에 모은다
                 report["errors"].append({"path": jpath, "error": f"{type(exc).__name__}: {exc}"})
                 continue
-            dst.writestr(jpath, json.dumps(payload, ensure_ascii=False))
+            dst.writestr(_entry(jpath, src.getinfo(by_name[jpath])), json.dumps(payload, ensure_ascii=False))
             report["documents"] += 1
             report["payloads"].append({
                 "path": jpath, "law_id": payload.get("law_id"), "mst": payload.get("mst"),
@@ -294,33 +326,97 @@ def convert_zip(zip_path: Path, manifest: dict, out_zip: Path) -> dict:
                     report["dropped"] += 1
                     continue
                 new = rename.get(path)
-                dst.writestr((path.rsplit("/", 1)[0] + "/" + new) if new else path, src.read(by_name[path]))
+                target = (path.rsplit("/", 1)[0] + "/" + new) if new else path
+                dst.writestr(_entry(target, src.getinfo(by_name[path])), src.read(by_name[path]))
                 report["renamed" if new else "kept"] += 1
     return report
 
 
-def convert_inbox(inbox: Path, outbox: Path) -> list:
-    reports = []
-    for zp in sorted(inbox.glob("*.zip")):
-        mf_path = zp.with_name(zp.stem + ".manifest.json")
-        if not mf_path.exists():
-            reports.append({"zip": zp.name, "errors": [{"error": "manifest 없음"}]})
-            continue
+PENDING_MANIFEST, CONVERTED, SKIPPED, FAILED = "pending_manifest", "converted", "skipped", "failed"
+
+
+def _pair(zp: Path) -> Path:
+    return zp.with_name(zp.stem + ".manifest.json")
+
+
+def _move_pair(zp: Path, dest: Optional[Path]) -> None:
+    if dest is None:
+        return
+    dest.mkdir(parents=True, exist_ok=True)
+    for p in (zp, _pair(zp)):
+        if p.exists():
+            os.replace(p, dest / p.name)
+
+
+def convert_one(zp: Path, outbox: Path, *, done_dir: Optional[Path] = None,
+                failed_dir: Optional[Path] = None) -> dict:
+    """배달 ZIP 1건: 변환 → 변환본·manifest 원자적 게시 → 원본 쌍 이동. 반환: 보고 dict(status 포함).
+
+    status
+      converted        게시함. 원본 쌍은 done_dir 로(주어졌을 때).
+      skipped          같은 원본(sha256)을 이미 변환해 둠 — 다시 쓰지 않는다. 원본 쌍은 done_dir 로.
+      failed           변환 오류. **아무것도 게시하지 않는다.** 원본 쌍과 보고는 failed_dir 로.
+      pending_manifest manifest 가 아직 없음 — 제자리(수신기가 manifest 를 먼저 두므로 자동 경로엔 안 생긴다).
+
+    게시 순서는 consume-zip 의 수신 규약을 따른다 — `.part` 에 다 쓰고, manifest 를 최종 이름으로 먼저,
+    그 다음 ZIP 을 rename. 문서 하나라도 실패하면 게시하지 않는다: 일부만 담긴 ZIP 은 manifest 문서 수와
+    어긋나 consume-zip 이 통째로 거부하므로(manifest_mismatch) 반쯤 게시해 봐야 의미가 없다."""
+    mf_path = _pair(zp)
+    if not mf_path.exists():
+        return {"zip": zp.name, "status": PENDING_MANIFEST, "errors": []}
+    final_zip, final_mf, part = outbox / zp.name, outbox / mf_path.name, outbox / f".{zp.name}.part"
+    report = {"zip": zp.name, "status": FAILED, "errors": []}
+    try:
+        source_sha = _sha256(zp)
         manifest = json.loads(mf_path.read_text(encoding="utf-8"))
-        out_zip = outbox / zp.name
-        reports.append(convert_zip(zp, manifest, out_zip))
-        write_manifest(out_zip, manifest.get("docs") or [], outbox / mf_path.name)
-    return reports
+        if final_zip.exists() and final_mf.exists():
+            prev = (json.loads(final_mf.read_text(encoding="utf-8")).get("source") or {}).get("sha256")
+            if prev == source_sha:
+                report["status"] = SKIPPED
+                _move_pair(zp, done_dir)
+                return report
+        outbox.mkdir(parents=True, exist_ok=True)
+        part.unlink(missing_ok=True)
+        report.update(convert_zip(zp, manifest, part))
+        if report["errors"]:
+            raise ConvertError(f"문서 {len(report['errors'])}건 변환 실패")
+        write_manifest(part, manifest.get("docs") or [], final_mf, file_name=zp.name,
+                       source={"file": zp.name, "sha256": source_sha})
+        os.replace(part, final_zip)
+        report["status"] = CONVERTED
+        _move_pair(zp, done_dir)
+        return report
+    except ConvertError:
+        pass                                         # 문서 단위 오류는 이미 report["errors"] 에 있다
+    except Exception as exc:                         # BadZipFile · JSONDecodeError · OSError — 이 ZIP 만 실패
+        report["errors"].append({"error": f"{type(exc).__name__}: {exc}"})
+    part.unlink(missing_ok=True)
+    if failed_dir is not None:
+        failed_dir.mkdir(parents=True, exist_ok=True)
+        (failed_dir / f"{zp.stem}.convert-report.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+        _move_pair(zp, failed_dir)
+    return report
+
+
+def convert_inbox(inbox: Path, outbox: Path, *, done_dir: Optional[Path] = None,
+                  failed_dir: Optional[Path] = None) -> list:
+    """inbox 의 `*.zip`(+ 같은 이름 .manifest.json)을 파일명 순서로 변환한다. 한 ZIP 의 실패가 다음 ZIP 을
+    막지 않는다. done_dir/failed_dir 를 주면 원본 쌍을 그리로 옮기고, 없으면 제자리에 둔다(수동 실행)."""
+    return [convert_one(zp, outbox, done_dir=done_dir, failed_dir=failed_dir)
+            for zp in sorted(inbox.glob("*.zip")) if not zp.name.startswith(".")]
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="투라인 배달 ZIP → 적재기 정규화 ZIP")
     ap.add_argument("inbox", type=Path)
     ap.add_argument("outbox", type=Path)
+    ap.add_argument("--done", type=Path, default=None, help="변환한 원본 쌍을 옮길 폴더(없으면 제자리)")
+    ap.add_argument("--failed", type=Path, default=None, help="실패한 원본 쌍과 보고를 옮길 폴더(없으면 제자리)")
     args = ap.parse_args(argv)
-    reports = convert_inbox(args.inbox, args.outbox)
+    reports = convert_inbox(args.inbox, args.outbox, done_dir=args.done, failed_dir=args.failed)
     print(json.dumps(reports, ensure_ascii=False, indent=1))
-    return 1 if any(r.get("errors") for r in reports) else 0
+    return 1 if any(r.get("status") == FAILED for r in reports) else 0
 
 
 if __name__ == "__main__":
