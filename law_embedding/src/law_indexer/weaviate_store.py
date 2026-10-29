@@ -98,7 +98,8 @@ SCHEMA = [
     _f("reference_ids", "text[]", "필터 · 위임·인용 대상 provision_id 목록"),
     _f("parent_provision_id", "text", "필터 · 상위 조문/별표"),
     _f("ministry", "text", "필터 · 소관부처"),
-    _f("domain", "text", "필터 · law/admrul/schlpub — 데이터 레포·컬렉션과 1:1"),
+    _f("domain", "text", "필터 · law/admrul/schlpub — 한 컬렉션 안의 코퍼스 구분자. "
+                         "도메인별 검색은 이 필터로 하고, 삭제 연산도 이 값으로 범위를 가둔다"),
     _f("law_name", "text", "필터 · 법령/행정규칙명 (이 법 안에서만 검색용 exact match)"),
     _f("law_type", "text", "필터 · 법률/대통령령/부령/고시 등"),
     _f("source_type", "text", "필터 · JSON 본문/FILE 첨부"),
@@ -164,6 +165,25 @@ class WeaviateStore(AbstractContextManager):
     def __exit__(self, *args):
         """context manager 종료 시 Weaviate client 연결을 닫는다."""
         self.client.close()
+
+    def _scoped(self, where):
+        """law_id 로 좁히는 삭제 필터에 도메인 조건을 AND 로 덧댄다.
+
+        **왜 필요한가.** law_id 는 생산자의 doc_id 를 그대로 쓰는데(collector/law.py·admrul.py)
+        법령과 행정규칙이 **서로 다른 ID 공간**이면서 네임스페이스가 없다. 지금 충돌이 0건인 건
+        법제처가 법령ID 를 6자리 zero-padding 으로 주기 때문이지(`010704` vs `10704`) 코드가
+        보장하는 게 아니다 — 앞 0 을 무시하면 실측 5건이 겹친다. 컬렉션이 분리돼 있을 때는
+        경계가 사고를 막아 주지만, 한 컬렉션으로 합치면 그 방어막이 사라져
+        `delete_by_law_id`·`delete_stale_law_chunks` 가 상대 도메인 문서를 통째로 지운다.
+
+        `domain` 은 이미 filterable 이고 모든 청크에 채워지므로(SCHEMA·mapper) 조건 하나로 막힌다.
+        source 를 모르고 연 연결(기존 동작)에서는 덧대지 않는다 — 틀린 도메인으로 좁히면
+        지워야 할 청크를 못 지워 고아가 남고, 그게 안 지우느니만 못하다.
+        """
+        if not self.source:
+            return where
+        from weaviate.classes.query import Filter
+        return where & Filter.by_property("domain").equal(self.source)
 
     def health(self) -> bool:
         """Weaviate 서버가 요청을 받을 준비가 됐는지 확인한다."""
@@ -372,7 +392,7 @@ class WeaviateStore(AbstractContextManager):
             return 0
         coll = self.client.collections.get(collection)
         existing = coll.query.fetch_objects(
-            filters=(
+            filters=self._scoped(
                 Filter.by_property("law_id").equal(law_id)
                 & Filter.by_property("version_uid").equal(version_uid)
                 & Filter.by_property("source_type").equal("JSON")
@@ -397,7 +417,8 @@ class WeaviateStore(AbstractContextManager):
         싹 지운다. 다른 법의 객체는 건드리지 않는다(law_id 로 정확히 좁혀 삭제)."""
         from weaviate.classes.query import Filter
         coll = self.client.collections.get(collection)
-        result = coll.data.delete_many(where=Filter.by_property("law_id").equal(law_id))
+        result = coll.data.delete_many(
+            where=self._scoped(Filter.by_property("law_id").equal(law_id)))
         return getattr(result, "successful", None) or getattr(result, "matches", 0) or 0
 
     def delete_stale_law_chunks(self, law_id: str, keep_version_uids: List[str], collection: str) -> int:
@@ -412,7 +433,7 @@ class WeaviateStore(AbstractContextManager):
             return 0
         from weaviate.classes.query import Filter
         coll = self.client.collections.get(collection)
-        where = Filter.by_property("law_id").equal(law_id)
+        where = self._scoped(Filter.by_property("law_id").equal(law_id))
         for vuid in keep:
             where = where & Filter.by_property("version_uid").not_equal(vuid)
         result = coll.data.delete_many(where=where)
@@ -508,8 +529,8 @@ class WeaviateStore(AbstractContextManager):
         removed = 0
         while True:
             res = coll.query.fetch_objects(
-                filters=(Filter.by_property("law_id").equal(law_id)
-                         & Filter.by_property("provision_id").like(f"{old_head}*")),
+                filters=self._scoped(Filter.by_property("law_id").equal(law_id)
+                                     & Filter.by_property("provision_id").like(f"{old_head}*")),
                 limit=500, return_properties=["provision_id"])
             doomed = []
             for obj in res.objects:
@@ -533,7 +554,8 @@ class WeaviateStore(AbstractContextManager):
         from weaviate.classes.query import Filter
         coll = self.client.collections.get(collection)
         result = coll.query.fetch_objects(
-            filters=Filter.by_property("law_id").equal(law_id), limit=1, return_properties=["law_id"])
+            filters=self._scoped(Filter.by_property("law_id").equal(law_id)),
+            limit=1, return_properties=["law_id"])
         return len(result.objects) > 0
 
     def missing_ids(self, uuids: List[str], collection: str) -> set:

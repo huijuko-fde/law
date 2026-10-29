@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 from law_indexer.config import Settings
+from law_indexer.law_scope import parse_scope
 from law_indexer.package import consume_package, is_package_file
 from law_indexer.pipeline import index_changeset
 
@@ -97,6 +98,62 @@ def test_index_changeset_auto_routes_to_package(tmp_path):
     # 개정=upsert 먼저 → delete_by_law_id 안 부르고, 옛 버전은 upsert 후 stale 정리로.
     assert store.deleted == []
     assert [s[0] for s in store.stale] == ["L1"]
+
+
+# ── 적재 범위(scope) ────────────────────────────────────────────────────
+
+def _scope(*law_names):
+    """관리 화면 목록에 해당하는 LawScope — 법령명만 담는다."""
+    return parse_scope({"code": 0, "data": {"law_names": list(law_names), "ministries": []}})
+
+
+def test_scope_skips_out_of_list_law(tmp_path):
+    """목록 밖 법령은 청크를 하나도 만들지 않는다 — 수집은 그대로, 적재만 좁힌다."""
+    pkg = _write(
+        tmp_path, _header(),
+        {"record_type": "document", "op": "upsert", "law_id": "L1", "payload": _law_payload("L1")},
+        {"record_type": "document", "op": "upsert", "law_id": "L2", "payload": _law_payload("L2")},
+    )
+    store, embedder = FakeStore(), FakeEmbedder()
+    totals = consume_package(store, embedder, Settings.from_env(), pkg, scope=_scope("법L1"))
+    assert [o.law_id for o in _flat(store.upserted)] == ["L1"]
+    assert totals["scope_matched"] == 1 and totals["scope_skipped"] == 1
+    # 목록 밖(L2)은 적재도 삭제도 하지 않는다 — 폐지 신호가 없으므로 기존 청크를 건드리지 않는다.
+    assert store.deleted == []
+
+
+def test_scope_none_indexes_everything(tmp_path):
+    """스위치가 꺼져 scope 가 없으면 기존 동작 그대로 — 집계 키도 생기지 않는다."""
+    pkg = _write(
+        tmp_path, _header(),
+        {"record_type": "document", "op": "upsert", "law_id": "L1", "payload": _law_payload("L1")},
+        {"record_type": "document", "op": "upsert", "law_id": "L2", "payload": _law_payload("L2")},
+    )
+    store, embedder = FakeStore(), FakeEmbedder()
+    totals = consume_package(store, embedder, Settings.from_env(), pkg)
+    assert sorted(o.law_id for o in _flat(store.upserted)) == ["L1", "L2"]
+    assert "scope_skipped" not in totals
+
+
+def test_scope_does_not_block_repeal(tmp_path):
+    """폐지는 목록 포함 여부와 무관하게 기존 VDB 데이터를 정리한다."""
+    pkg = _write(tmp_path, _header(), {"record_type": "delete", "law_id": "L9"})
+    store, embedder = FakeStore(), FakeEmbedder()
+    totals = consume_package(store, embedder, Settings.from_env(), pkg, scope=_scope("법L1"))
+    assert store.deleted == ["L9"] and totals["deleted_docs"] == 1
+
+
+def test_scope_out_of_list_repeal_with_content_still_deletes(tmp_path):
+    """폐지가 내용과 함께 와도(개정 경로) 목록 밖이면 적재는 막고 삭제는 수행한다."""
+    pkg = _write(
+        tmp_path, _header(),
+        {"record_type": "document", "op": "upsert", "law_id": "L2", "payload": _law_payload("L2")},
+        {"record_type": "delete", "law_id": "L2"},
+    )
+    store, embedder = FakeStore(), FakeEmbedder()
+    totals = consume_package(store, embedder, Settings.from_env(), pkg, scope=_scope("법L1"))
+    assert store.upserted == [] and store.deleted == ["L2"]
+    assert totals["scope_skipped"] == 1
 
 
 # ── record_type 별 ──────────────────────────────────────────────────────

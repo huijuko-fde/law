@@ -643,8 +643,13 @@ class DocParserClient:
     """첨부용 전처리기 HTTP 클라이언트. GET /healthcheck, POST /run."""
 
     def __init__(self, base_url: str, timeout: float = 60.0, max_retries: int = 2,
-                 endpoint_path: str = "/run", api_key: Optional[str] = None, upload: bool = False):
+                 endpoint_path: str = "/run", api_key: Optional[str] = None, upload: bool = False,
+                 image_base_url: Optional[str] = None):
         self.base_url = base_url.rstrip("/")
+        # 지능형(이미지) 전처리기가 **다른 파드**일 때만 채운다 — genos 전처리기 패키지는 배포마다
+        # 파드가 따로 떠서(preprocessor-N) base 가 갈린다. 코드서빙 구성은 한 서빙이 두 경로를
+        # 다 노출하므로 비워 두면 base_url 을 그대로 쓴다.
+        self.image_base_url = image_base_url.rstrip("/") if image_base_url else None
         self.timeout = timeout
         self.max_retries = max(0, max_retries)
         # genos 코드서빙은 /run 이 아니라 /preprocess_attachment(_upload) 이고 Bearer 인증이 필요하다.
@@ -706,7 +711,12 @@ class DocParserClient:
             headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        url = f"{self.base_url}{endpoint}"
+        # 경로(endpoint)는 호출부가 고르고, base 는 여기서 고른다 — 이미지는 지능형 파드로.
+        #   이렇게 두면 run() 을 부르는 모든 경로(index·package·index-files)가 같이 적용된다.
+        base = (self.image_base_url
+                if self.image_base_url and is_image_file(Path(file_path))
+                else self.base_url)
+        url = f"{base}{endpoint}"
 
         last_error: Optional[DocParserError] = None
         for _attempt in range(self.max_retries + 1):

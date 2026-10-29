@@ -22,14 +22,13 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from law_indexer.weaviate_store import SCHEMA  # noqa: E402
 
-# 컬렉션 3종 — (파일 접미, 기본 클래스명, 설명 앞머리)
+# 컬렉션 1종 — (파일 접미, 기본 클래스명, 설명 앞머리)
+#   법령·행정규칙·학칙공단이 **한 컬렉션**을 쓴다(config.Settings 기본값). 35속성이 세 레포에서
+#   완전히 동일하고 코퍼스 구분은 `domain` 필터가 하므로 나눌 이유가 없다. 나누는 구성으로
+#   되돌리려면 여기에 항목을 추가하고 ADMRUL_COLLECTION 등을 명시하면 된다.
 COLLECTIONS = [
     ("law", "LegalProvisionIndex",
-     "법령(법률·시행령·시행규칙 = LAW 레포)"),
-    ("admrul", "AdmrulProvisionIndex",
-     "행정규칙(고시·훈령·예규 = ADMRUL 레포)"),
-    ("schlpubrul", "SchlPubRulProvisionIndex",
-     "학칙공단(학칙·공단정관·공공기관 규정 = SCHLPUBRUL 레포)"),
+     "법령·행정규칙·학칙공단(LAW·ADMRUL·SCHLPUBRUL 레포 통합)"),
 ]
 
 _DTYPE = {"text": "text", "text[]": "text[]", "int": "int", "date": "date", "boolean": "boolean"}

@@ -358,6 +358,37 @@ def test_run_success_filters_empty_text_chunks(monkeypatch):
     assert len(chunks) == 1 and chunks[0]["text"] == "본문1"
 
 
+def _url_capturing_client(monkeypatch, seen, **kwargs):
+    body = json.dumps({"code": 0, "errMsg": "success", "data": [{"text": "x"}]}).encode("utf-8")
+
+    def responder(req, timeout=None):
+        seen.append(req.full_url)
+        return _FakeResponse(200, body)
+
+    monkeypatch.setattr("law_indexer.preprocess.urllib.request.urlopen", responder)
+    return DocParserClient("http://attach:8080", timeout=1, max_retries=0, **kwargs)
+
+
+def test_run_routes_images_to_image_base_url(monkeypatch):
+    """이미지는 지능형 파드로, 문서는 첨부용 파드로 보낸다.
+
+    genos 전처리기 패키지 구성은 배포마다 파드가 따로 떠(preprocessor-N) base 가 갈린다 —
+    경로만 바꿔서는 지능형에 닿지 못한다."""
+    seen = []
+    client = _url_capturing_client(monkeypatch, seen, image_base_url="http://intel:8080")
+    client.run(Path("/tmp/sample.hwpx"), 2000, 200)
+    client.run(Path("/tmp/sample.png"), 2000, 200)
+    assert seen == ["http://attach:8080/run", "http://intel:8080/run"]
+
+
+def test_run_without_image_base_url_keeps_single_base(monkeypatch):
+    """image_base_url 을 안 주면 이미지도 기본 base 로 간다 — 코드서빙 구성(한 서빙·두 경로) 기존 동작."""
+    seen = []
+    client = _url_capturing_client(monkeypatch, seen)
+    client.run(Path("/tmp/sample.png"), 2000, 200)
+    assert seen == ["http://attach:8080/run"]
+
+
 def test_run_application_error_on_nonzero_code(monkeypatch):
     body = json.dumps({"code": 1, "errMsg": "실패"}).encode("utf-8")
     client = _patched_client(monkeypatch, lambda req, timeout=None: _FakeResponse(200, body))

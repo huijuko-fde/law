@@ -30,6 +30,7 @@ from typing import Callable, Dict, List, Optional
 
 from .config import Settings
 from .embedder import LocalEmbedder
+from .law_scope import LawScope
 from .mapper import (
     _compact_name, build_search_text, iso_date, map_admrul_data, map_attachment_data,
     map_law_data, stable_id,
@@ -416,6 +417,8 @@ class _Context:
     # 전처리까지 성공한 inbox 파일을 지울지. 옆채널은 생산자와 공유하는 전달 영역이라
     # 안 지우면 계속 쌓인다. 재처리·원인확인이 필요하면 끄고 쓴다(기본 off).
     delete_consumed_files: bool = False
+    # 적재 범위(관리 화면 목록). None 이면 필터 없음 — 수집은 전량 유지하고 적재만 좁힌다.
+    scope: Optional[LawScope] = None
     mirror: Optional[RepoMirror] = None           # C 옵션 — 데이터 레포 repo 레이아웃 최신화
 
 
@@ -784,6 +787,29 @@ def _flush_law(ctx: _Context, store, embedder: LocalEmbedder, buffer: _LawBuffer
         totals["pending_attachments"] += len(buffer.pending)
         return
 
+    # 적재 범위 게이트 — 수집은 전량 유지하고 **임베딩·적재만** 관리 화면 목록으로 좁힌다.
+    #   순수 폐지는 위에서 이미 처리하고 return 했으므로, 목록 밖이라고 폐지가 묻히지 않는다.
+    #   여기 걸리는 건 '내용이 있는' 경우뿐이라 청크 생성·임베딩 전에 끊어 비용도 안 든다.
+    if ctx.scope is not None:
+        try:
+            selected = ctx.scope.matches(buffer.document)
+        except ValueError as exc:
+            totals["laws_failed"] += 1
+            totals["errors"].append({"law_id": law_id, "error": str(exc)})
+            return
+        if not selected:
+            totals["scope_skipped"] += 1
+            # 개정으로 올라온 폐지(delete + 내용) 는 적재만 막고 **삭제는 수행**한다 —
+            # 목록 밖이라고 폐지 신호를 흘리면 사라진 법이 검색에 남는다.
+            if buffer.delete:
+                try:
+                    store.delete_by_law_id(law_id, ctx.collection)
+                except Exception as exc:
+                    totals["errors"].append({"law_id": law_id, "error": f"삭제 실패: {exc}"})
+                totals["deleted_docs"] += 1
+            return
+        totals["scope_matched"] += 1
+
     law_meta = _law_meta(buffer.document, law_id)
     git_path = buffer.document_git_path or f"package:{law_id}"
     law_meta["git_path"] = law_meta.get("git_path") or buffer.document_git_path
@@ -1007,7 +1033,8 @@ def _apply_rename(ctx: _Context, routed: "_RoutedStores", settings: Settings,
 
 def consume_package(store, embedder: LocalEmbedder, settings: Settings, package_path: Path,
                     source_override: Optional[str] = None,
-                    doc_parser: Optional[DocParserClient] = None) -> dict:
+                    doc_parser: Optional[DocParserClient] = None,
+                    scope: Optional[LawScope] = None) -> dict:
     """JSONL package를 소비해 Weaviate에 적재한다.
 
     - source는 package_header의 source를 우선하고, 없으면 source_override(CLI --source)를 쓴다.
@@ -1072,10 +1099,14 @@ def consume_package(store, embedder: LocalEmbedder, settings: Settings, package_
         doc_parser=doc_parser or (DocParserClient(
             settings.doc_parser_base_url, settings.doc_parser_timeout, settings.doc_parser_max_retries,
             endpoint_path=settings.doc_parser_endpoint_path, api_key=settings.doc_parser_api_key,
-            upload=settings.doc_parser_upload)
+            upload=settings.doc_parser_upload, image_base_url=settings.doc_parser_image_base_url)
             if settings.package_preprocess_files else None),
-        settings=settings, original=original,
+        settings=settings, original=original, scope=scope,
     )
+    if scope is not None:
+        totals.update(scope_skipped=0, scope_matched=0,
+                      scope_law_names=len(scope.law_names),
+                      scope_ministries=len(scope.ministries))
 
     # 문서별 컬렉션 라우팅 — admrul package 에 섞여 온 학칙공단 문서(doc_target=school/pi/public,
     # delete 는 law_id 접두)는 schlpub 컬렉션으로 보낸다. 그 외에는 package source 그대로.

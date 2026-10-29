@@ -86,3 +86,41 @@ def test_store_anonymous_when_no_key(monkeypatch):
     WeaviateStore(settings)
     assert captured["auth_credentials"] is None              # 익명(로컬 그대로)
     assert captured["http_secure"] is False
+
+
+def test_collections_merge_by_default(monkeypatch):
+    """기본은 단일 컬렉션 — 세 source 가 같은 컬렉션을 가리킨다.
+
+    스키마 35속성이 세 레포에서 동일하고 코퍼스 구분은 `domain` 필터가 하므로 나눌 이유가 없다.
+    나눠 두면 법령↔행정규칙 상호참조를 한 질의로 못 풀고 키도 따로 필요하다(RBAC).
+    """
+    _no_dotenv(monkeypatch)
+    for key in ("LAW_COLLECTION", "WEAVIATE_COLLECTION", "ADMRUL_COLLECTION", "SCHLPUB_COLLECTION"):
+        monkeypatch.delenv(key, raising=False)
+    s = Settings.from_env()
+    assert s.collection_for("law") == "LegalProvisionIndex"
+    assert s.collection_for("admrul") == "LegalProvisionIndex"
+    assert s.collection_for("schlpub") == "LegalProvisionIndex"
+
+
+def test_law_collection_override_carries_to_others(monkeypatch):
+    """LAW_COLLECTION 만 바꿔도 나머지가 따라온다 — 합친 구성을 한 곳에서 돌린다."""
+    _no_dotenv(monkeypatch)
+    for key in ("WEAVIATE_COLLECTION", "ADMRUL_COLLECTION", "SCHLPUB_COLLECTION"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("LAW_COLLECTION", "MergedIndex")
+    s = Settings.from_env()
+    assert s.collection_for("admrul") == "MergedIndex"
+    assert s.collection_for("schlpub") == "MergedIndex"
+
+
+def test_explicit_admrul_collection_still_splits(monkeypatch):
+    """명시하면 분리 구성도 그대로 된다 — 되돌릴 길을 막지 않는다."""
+    _no_dotenv(monkeypatch)
+    monkeypatch.delenv("WEAVIATE_COLLECTION", raising=False)
+    monkeypatch.delenv("SCHLPUB_COLLECTION", raising=False)
+    monkeypatch.setenv("LAW_COLLECTION", "LegalProvisionIndex")
+    monkeypatch.setenv("ADMRUL_COLLECTION", "AdmrulProvisionIndex")
+    s = Settings.from_env()
+    assert s.collection_for("law") == "LegalProvisionIndex"
+    assert s.collection_for("admrul") == "AdmrulProvisionIndex"

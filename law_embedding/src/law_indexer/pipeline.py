@@ -184,7 +184,8 @@ def index_attachment_files(store: WeaviateStore, embedder: LocalEmbedder, path: 
                              "목업 청크 적재를 막기 위해 실행을 중단합니다.")
         doc_parser = DocParserClient(
             settings.doc_parser_base_url, settings.doc_parser_timeout, settings.doc_parser_max_retries,
-            settings.doc_parser_endpoint_path, settings.doc_parser_api_key, settings.doc_parser_upload)
+            settings.doc_parser_endpoint_path, settings.doc_parser_api_key, settings.doc_parser_upload,
+            image_base_url=settings.doc_parser_image_base_url)
 
     def load(file_path: Path) -> List[LegalProvision]:
         parent = find_parent_law(file_path)
@@ -204,7 +205,8 @@ def index_attachment_files(store: WeaviateStore, embedder: LocalEmbedder, path: 
 
 
 def index_changeset(store: WeaviateStore, embedder: LocalEmbedder, settings: Settings,
-                    changeset_path: Path, source: str, data_root: Optional[Path] = None) -> dict:
+                    changeset_path: Path, source: str, data_root: Optional[Path] = None,
+                    scope=None) -> dict:
     """증분(JSONL)을 소비해 **변경분만** 재적재한다. 입력 첫 줄로 두 계약을 자동감지한다:
 
     - 첫 줄이 `package_header` 면 **§6 JSONL package** 소비자로 위임한다(consume_package) —
@@ -219,7 +221,8 @@ def index_changeset(store: WeaviateStore, embedder: LocalEmbedder, settings: Set
     폐지 문서의 청크를 law_id 단위로 지운다. payload 가 없으면 git_path 를 data_root 기준으로 읽어
     채운다(git 모드 폴백). 한 줄이 실패해도 건너뛰고 계속한다."""
     if is_package_file(changeset_path):
-        return consume_package(store, embedder, settings, changeset_path, source_override=source)
+        return consume_package(store, embedder, settings, changeset_path, source_override=source,
+                               scope=scope)
 
     if source not in ("law", "admrul", "schlpub"):
         raise ValueError(f"source 는 'law'/'admrul'/'schlpub' 중 하나여야 합니다: {source!r}")
@@ -464,7 +467,7 @@ def _fail_or_retry(claimed: Path, original: Path, name: str, folder: Path,
 def consume_folder(embedder: LocalEmbedder, settings: Settings, folder: Path, *,
                    processed_dir: Optional[Path] = None, failed_dir: Optional[Path] = None,
                    source_override: Optional[str] = None, pattern: str = "*.jsonl",
-                   nack_dir: Optional[Path] = None) -> dict:
+                   nack_dir: Optional[Path] = None, scope=None) -> dict:
     """폴더에 도착한 package(*.jsonl)들을 오래된 순서로 **안전하게** 소비한다(스트리밍 소비자).
 
     안전장치:
@@ -536,7 +539,8 @@ def consume_folder(embedder: LocalEmbedder, settings: Settings, folder: Path, *,
                     continue
 
             try:
-                result = consume_package(store, embedder, settings, claimed, source_override=source)
+                result = consume_package(store, embedder, settings, claimed, source_override=source,
+                                         scope=scope)
             except Exception as exc:                    # 예상외 예외 = 일시장애로 간주 → 재시도
                 _fail_or_retry(claimed, pkg, name, folder, failed_dir,
                                [{"error": str(exc)}], summary, transient=True,
@@ -667,7 +671,7 @@ def index_documents(store: WeaviateStore, embedder: LocalEmbedder, settings: Set
             doc_parser = DocParserClient(
                 settings.doc_parser_base_url, settings.doc_parser_timeout, settings.doc_parser_max_retries,
                 endpoint_path=settings.doc_parser_endpoint_path, api_key=settings.doc_parser_api_key,
-                upload=settings.doc_parser_upload)
+                upload=settings.doc_parser_upload, image_base_url=settings.doc_parser_image_base_url)
         else:
             logger.info("첨부 전처리 비활성 — 본문 JSON 만 색인합니다"
                         " (INDEX_PREPROCESS_FILES=%s, DOC_PARSER_BASE_URL=%s)",
@@ -686,7 +690,8 @@ def index_documents(store: WeaviateStore, embedder: LocalEmbedder, settings: Set
 
     if scope is not None:
         totals.update(scope_skipped=0, scope_matched=0,
-                      scope_prompt_id=scope.prompt_id, scope_revision_id=scope.revision_id)
+                      scope_law_names=len(scope.law_names),
+                      scope_ministries=len(scope.ministries))
 
     for source in sources:
         try:
@@ -883,6 +888,17 @@ def index_documents(store: WeaviateStore, embedder: LocalEmbedder, settings: Set
             if law_id and version_uid and json_chunk_ids:
                 json_cleanups.append((law_id, version_uid, json_chunk_ids))
         bulk.add(str(source), objects, file_cleanups, json_cleanups)
+
+    # 범위에 적었는데 한 번도 안 걸린 항목 = 대개 오타·구명칭. 조용하면 범위가 의도보다
+    # 좁아진 채로 '성공' 이 찍힌다(수집기 temporal_law 도 같은 경고를 낸다).
+    if scope is not None:
+        miss_names, miss_min = scope.unmatched()
+        totals.update(scope_names_unmatched=len(miss_names),
+                      scope_ministries_unmatched=len(miss_min))
+        if miss_names:
+            logger.warning("[scope] 미매칭 법령명(대상 문서에 없음): %s", ", ".join(miss_names))
+        if miss_min:
+            logger.warning("[scope] 미매칭 부처(소관부처명에 없음): %s", ", ".join(miss_min))
 
     bulk.flush()
     return totals

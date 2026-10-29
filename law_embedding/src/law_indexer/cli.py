@@ -7,14 +7,17 @@ from typing import List, Optional
 from . import git_sync
 from .config import Settings
 from .embedder import make_embedder
+from .law_scope import load_law_scope
 from .mapper import load_attachment_json
 from .package import peek_package_source
 from .pipeline import (consume_folder, find_preprocess_targets, index_attachment_files,
                        index_changeset, index_documents, index_paths)
 from .weaviate_store import WeaviateStore
+from .zip_consume import consume_zip_folder
 
 # 본문/첨부 순회 적재 명령들 (임베딩 모델 필요)
-INDEX_COMMANDS = {"index", "index-files", "index-attachment-chunks", "index-changeset", "consume-folder"}
+INDEX_COMMANDS = {"index", "index-files", "index-attachment-chunks", "index-changeset", "consume-folder",
+                  "consume-zip"}
 
 _SOURCES = ("law", "admrul", "schlpub")
 # --source 선택지: 개별 3종 + 전부("both" 는 2컬렉션 시절 이름의 하위호환 별칭 — "all" 과 동일)
@@ -44,6 +47,8 @@ def _failure_code(result) -> int:
     if not isinstance(result, dict):
         return 0
     if result.get("failed"):                       # consume-folder 요약
+        return 2
+    if result.get("partial"):                      # consume-zip 요약 — 일부 문서 거부(나머지는 적재)
         return 2
     for k in ("files_failed", "objects_failed", "attachments_failed", "laws_failed"):
         if result.get(k):
@@ -149,6 +154,17 @@ def parser() -> argparse.ArgumentParser:
                     help="격리 시 생산자에 되돌릴 목록을 남길 폴더(기본 PACKAGE_NACK_DIR 또는 <dir>/nack). "
                          "수집기의 PACKAGE_NACK_DIR 과 같은 경로여야 재발송/재수집이 걸린다")
     cf.add_argument("--source", choices=_SOURCES, default=None, help="header 에 source 없을 때만")
+
+    cz = sub.add_parser("consume-zip",
+                        help="폴더에 도착한 법령 ZIP(*.zip)을 파일명 순서로 package 변환 → consume-folder 경로로 적재 "
+                             "+ ZIP 별 처리 이력(SHA-256 중복 방지·done/failed 이동)")
+    cz.add_argument("--dir", type=Path, required=True,
+                    help="ZIP 이 도착하는 폴더(그 밑에 done/·failed/·duplicate/·state/ 를 만든다)")
+    cz.add_argument("--package-dir", type=Path,
+                    help="변환한 package 를 두고 소비할 폴더(기본 <dir>/packages) — consume-folder --dir 와 같은 "
+                         "규칙(processed/·failed/·nack/)으로 소비한다")
+    cz.add_argument("--nack", type=Path,
+                    help="consume-folder --nack 과 같다(기본 PACKAGE_NACK_DIR 또는 <package-dir>/nack)")
 
     search = sub.add_parser("search")
     search.add_argument("--query", required=True)
@@ -284,8 +300,17 @@ def main(argv=None):
             raise SystemExit(0 if ready else 1)
 
         if args.command == "create-collection":
+            # 여러 source 가 같은 컬렉션을 가리키면(통합 구성) 한 번만 처리한다.
+            #   --recreate 는 컬렉션을 통째로 지우므로, 중복을 거르지 않으면 같은 컬렉션을
+            #   source 수만큼 delete+create 해 **직전 source 가 넣은 데이터를 날린다.**
+            #   분리 구성에서는 컬렉션명이 서로 달라 이 가드가 아무것도 바꾸지 않는다.
+            seen: dict[str, str] = {}
             for source in _sources_for(args.source):
                 _url, _path, _branch, collection = _repo_config(settings, source)
+                if collection in seen:
+                    print(f"[{source}] {collection}: 건너뜀 — [{seen[collection]}] 과 같은 컬렉션입니다")
+                    continue
+                seen[collection] = source
                 with WeaviateStore(settings, source) as store:
                     created = store.create_collection(collection, args.recreate)
                 print(f"[{source}] {collection}: " + ("컬렉션 생성 완료" if created else "이미 존재합니다"))
@@ -332,6 +357,9 @@ def main(argv=None):
                 if args.vector_cache:
                     from .pipeline import VectorCache
                     vector_cache = VectorCache(args.vector_cache)   # 1회 로드, 전 source 공유
+                # 적재 범위도 1회 조회 — 아래 이중 루프(source × target) 안에서 부르면
+                #   target 마다 admin-api 를 때린다.
+                scope = load_law_scope()
                 combined = {"by_source": {}}
                 for src in _sources_for(source):
                     collection = _repo_config(settings, src)[3]
@@ -346,7 +374,7 @@ def main(argv=None):
                                 source_repository, recursive, args.limit,
                                 skip_existing=args.skip_existing,
                                 paths=target_paths, files_only=args.files_only,
-                                vector_cache=vector_cache,
+                                vector_cache=vector_cache, scope=scope,
                             )
                             result["collection_count"] = store.count(collection)
                             combined["by_source"][label] = result
@@ -368,7 +396,8 @@ def main(argv=None):
                 # 맞는 키로 붙는다(1세대 change-set 은 --source 필수).
                 source = args.source or peek_package_source(args.input)
                 with WeaviateStore(settings, source) as store:
-                    result = index_changeset(store, embedder, settings, args.input, args.source, args.data_root)
+                    result = index_changeset(store, embedder, settings, args.input, args.source, args.data_root,
+                                             scope=load_law_scope())
                     resolved = result.get("source") or source
                     if resolved:
                         result["collection_count"] = store.count(_repo_config(settings, resolved)[3])
@@ -381,7 +410,14 @@ def main(argv=None):
                 failed = args.failed or (args.dir / "failed")
                 result = consume_folder(embedder, settings, args.dir, processed_dir=processed,
                                         failed_dir=failed, source_override=args.source,
-                                        nack_dir=args.nack)
+                                        nack_dir=args.nack, scope=load_law_scope())
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+                raise SystemExit(_failure_code(result))
+
+            if args.command == "consume-zip":
+                # ZIP → package(첨부는 file_transfer) → 기존 consume_folder 로 적재. 처리 이력은 <dir>/state.
+                result = consume_zip_folder(embedder, settings, args.dir, package_dir=args.package_dir,
+                                            nack_dir=args.nack, scope=load_law_scope())
                 print(json.dumps(result, ensure_ascii=False, indent=2))
                 raise SystemExit(_failure_code(result))
 

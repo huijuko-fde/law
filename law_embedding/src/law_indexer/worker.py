@@ -82,8 +82,8 @@ def initial_index(req: IndexRequest) -> dict:
     전처리기(DOC_PARSER_BASE_URL)가 붙어 있으면 is_file_only 별표까지 처리하고, 없으면 그 첨부만
     실패로 남기고 본문은 계속 색인한다('전처리 없이' 벌크 = docparser 서비스 미연결)."""
     settings = _get_settings()
-    from .prompt_scope import load_prompt_scope
-    scope = load_prompt_scope()
+    from .law_scope import load_law_scope
+    scope = load_law_scope()
     embedder = _get_embedder()
     source = req.source
     if source == "law":
@@ -118,12 +118,15 @@ def consume_package_activity(req: PackageRequest) -> dict:
     파일 record 를 내부 전처리기로 돌릴지는 PACKAGE_PREPROCESS_FILES 설정을 따른다(genos 는
     llmops-preprocess-api 를 DOC_PARSER_BASE_URL 로)."""
     settings = _get_settings()
+    from .law_scope import load_law_scope
+    scope = load_law_scope()
     embedder = _get_embedder()
     # 컬렉션마다 API 키가 달라 연결 전에 source 를 확정한다(package_header 우선).
     source = req.source or peek_package_source(Path(req.package_path))
     with heartbeating(), WeaviateStore(settings, source) as store:
         result = consume_package(
-            store, embedder, settings, Path(req.package_path), source_override=req.source)
+            store, embedder, settings, Path(req.package_path), source_override=req.source,
+            scope=scope)
     log.info("consume_package(%s) laws_indexed=%s deleted=%s",
              req.package_path, result.get("laws_indexed"), result.get("deleted_docs"))
     return result

@@ -256,7 +256,14 @@ def test_admrul_document_indexes_without_law_version_uid(tmp_path):
     assert all(o.version_uid for o in objs)  # version_uid 없어도 adm_uid 로 대체돼 채워진다
 
 
-def test_law_and_admrul_never_cross_collections(tmp_path):
+def test_law_and_admrul_never_cross_domains(tmp_path):
+    """도메인 태깅이 뒤바뀌지 않는다 — 합친 컬렉션에서는 이게 유일한 구분선이다.
+
+    기본 구성은 세 source 가 한 컬렉션을 쓰므로 '컬렉션이 다르다'로는 더 이상 검증할 수 없다.
+    대신 **청크마다 찍히는 domain(collection_type)이 그 문서의 출처와 일치**하는지를 본다 —
+    삭제 연산의 도메인 가드(WeaviateStore._scoped)가 이 값에 기대고 있어, 여기가 어긋나면
+    교차 삭제가 난다. provision_id 접두는 매핑 경로가 독립적으로 만드는 값이라 교차검증이 된다.
+    """
     law_root = tmp_path / "law_data"
     _write_law_doc(law_root, with_file_only_appendix=False, create_local_file=False)
     admrul_root = tmp_path / "admrul_data"
@@ -268,10 +275,15 @@ def test_law_and_admrul_never_cross_collections(tmp_path):
     index_documents(store, embedder, settings, admrul_root, "admrul", admrul_root, "c2",
                     "https://github.com/genonai/admrul_data.git", recursive=True, doc_parser=_FakeDocParser())
 
-    law_objs = store.objects_in(settings.law_collection)
-    admrul_objs = store.objects_in(settings.admrul_collection)
-    assert law_objs and all(o.collection_type == "law" for o in law_objs)
-    assert admrul_objs and all(o.collection_type == "admrul" for o in admrul_objs)
+    objs = (store.objects_in(settings.law_collection)
+            + ([] if settings.admrul_collection == settings.law_collection
+               else store.objects_in(settings.admrul_collection)))
+    assert objs, "두 번 색인했는데 아무것도 안 들어갔다"
+    kinds = {o.collection_type for o in objs}
+    assert kinds == {"law", "admrul"}, f"두 도메인이 다 있어야 한다: {kinds}"
+    for o in objs:
+        assert o.provision_id.startswith(f"{'SchlPubRul' if o.collection_type == 'schlpub' else o.collection_type}:"), \
+            f"domain={o.collection_type} 인데 provision_id 접두가 어긋난다: {o.provision_id}"
 
 
 def test_both_collections_use_same_embedding_model(tmp_path):

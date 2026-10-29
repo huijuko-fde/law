@@ -1,18 +1,24 @@
 # Weaviate 스키마
 
-컬렉션은 3개 — 데이터 레포당 하나 — 이고 전부 같은 스키마를 사용한다(클래스 이름만 다름).
+컬렉션은 **1개**다. 세 데이터 레포(LAW·ADMRUL·SCHLPUBRUL)가 같은 컬렉션을 쓰고, 코퍼스 구분은 `domain` 필터가 한다.
 
-| source | 기본 컬렉션 |
-| --- | --- |
-| `law` | `LegalProvisionIndex` |
-| `admrul` | `AdmrulProvisionIndex` |
-| `schlpub` | `SchlPubRulProvisionIndex` |
+| source | 기본 컬렉션 | `domain` 값 |
+| --- | --- | --- |
+| `law` | `LegalProvisionIndex` | `law` |
+| `admrul` | `LegalProvisionIndex` | `admrul` |
+| `schlpub` | `LegalProvisionIndex` | `schlpub` |
+
+35속성이 세 레포에서 완전히 동일해 나눌 이유가 없고, 나눠 두면 ① 법령↔행정규칙 상호참조(`reference_ids`)를 한 질의로 못 풀고 ② 컬렉션마다 Weaviate 키가 따로 필요하다(GenOS RBAC).
+
+나누는 구성으로 되돌리려면 `ADMRUL_COLLECTION`·`SCHLPUB_COLLECTION` 을 명시한다 — 그때는 해당 API 키도 같이 줘야 그 컬렉션이 보인다.
+
+> ⚠ `law_id` 는 생산자의 doc_id 를 그대로 쓰는데 법령과 행정규칙이 서로 다른 ID 공간이면서 네임스페이스가 없다. 충돌이 없는 건 법제처가 법령ID 를 6자리 zero-padding 으로 주기 때문이지(`010704` vs `10704`) 코드가 보장하는 게 아니다. 그래서 `law_id` 로 좁히는 삭제 연산은 전부 `domain` 조건을 AND 로 걸어 범위를 가둔다(`WeaviateStore._scoped`).
 
 컬렉션은 self-provided vector 방식이다. Weaviate 내부 vectorizer는 쓰지 않고, `law_embedding`이 만든 벡터를 직접 넣는다. 벡터 인덱스는 HNSW · cosine이다.
 
 속성은 **35개**이고 그중 `indexFilterable=true`가 **18개**, `indexSearchable=true`가 `search_text` 하나다. inverted index는 BM25 `b=0.75` · `k1=1.2`이고 `indexNullState`·`indexPropertyLength`·`indexTimestamps`는 모두 끈다.
 
-정의의 유일한 출처는 코드 상수 `weaviate_store.SCHEMA`이고, 납품용 정의서(루트 `genos_vdb_schema_law.json` · `genos_vdb_schema_admrul.json` · `genos_vdb_schema_schlpubrul.json`)도 거기서 뽑는다. 아래 표는 그 내용을 읽기 쉽게 옮긴 것이므로, 값이 어긋나면 코드와 JSON 쪽이 맞다.
+정의의 유일한 출처는 코드 상수 `weaviate_store.SCHEMA`이고, 납품용 정의서(루트 `genos_vdb_schema_law.json`)도 거기서 뽑는다. 아래 표는 그 내용을 읽기 쉽게 옮긴 것이므로, 값이 어긋나면 코드와 JSON 쪽이 맞다.
 
 ## 1. 필드 구성
 

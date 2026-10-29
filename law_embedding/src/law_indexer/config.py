@@ -71,6 +71,9 @@ class Settings:
     doc_parser_base_url: str
     doc_parser_endpoint_path: str            # 첨부용 — 기본(hwp/hwpx/pdf/docx 등 문서)
     doc_parser_image_endpoint_path: str      # 적재용(intelligent) — **이미지 전용**
+    # 지능형 전처리기를 **다른 파드**로 띄운 구성(genos 전처리기 패키지)에서만. 비우면 위 base 공용
+    # (코드서빙 구성은 한 서빙이 두 경로를 다 노출해 base 가 같다).
+    doc_parser_image_base_url: Optional[str]
     doc_parser_api_key: Optional[str]
     doc_parser_upload: bool
     doc_parser_timeout: float
@@ -197,6 +200,13 @@ class Settings:
         shared_dir = os.getenv("DOC_PARSER_SHARED_DIR")
         shared_host_dir = os.getenv("DOC_PARSER_SHARED_HOST_DIR") or shared_dir
         shared_container_dir = os.getenv("DOC_PARSER_SHARED_CONTAINER_DIR") or shared_dir
+        # 기본은 **단일 컬렉션**이다 — 세 source 가 같은 컬렉션을 가리킨다.
+        #   스키마 35속성이 세 레포에서 완전히 동일하고, 도메인 구분은 `domain` 프로퍼티가
+        #   이미 필터로 해 준다. 나눠 두면 법령↔행정규칙 상호참조(reference_id)를 한 질의로
+        #   못 풀고, 컬렉션마다 Weaviate 키가 따로 필요하다(RBAC).
+        #   나누고 싶으면 ADMRUL_COLLECTION/SCHLPUB_COLLECTION 을 명시하면 된다 — 그때는
+        #   해당 키(ADMRUL_WEAVIATE_API_KEY 등)도 같이 줘야 그 컬렉션이 보인다.
+        law_collection = os.getenv("LAW_COLLECTION", os.getenv("WEAVIATE_COLLECTION", "LegalProvisionIndex"))
         return cls(
             weaviate_http_host=os.getenv("WEAVIATE_HTTP_HOST", "localhost"),
             weaviate_http_port=int(os.getenv("WEAVIATE_HTTP_PORT", "8080")),
@@ -210,10 +220,10 @@ class Settings:
             weaviate_secure=_bool("WEAVIATE_SECURE", False),
             weaviate_replication_factor=int(os.getenv("WEAVIATE_REPLICATION_FACTOR", "3")),
             weaviate_shard_count=int(os.getenv("WEAVIATE_SHARD_COUNT", "3")),
-            # law_agent 등 기존 소비자가 기대하는 기본값(LegalProvisionIndex)을 법령 컬렉션이 그대로 물려받는다.
-            law_collection=os.getenv("LAW_COLLECTION", os.getenv("WEAVIATE_COLLECTION", "LegalProvisionIndex")),
-            admrul_collection=os.getenv("ADMRUL_COLLECTION", "AdmrulProvisionIndex"),
-            schlpub_collection=os.getenv("SCHLPUB_COLLECTION", "SchlPubRulProvisionIndex"),
+            # law_agent 등 기존 소비자가 기대하는 기본값(LegalProvisionIndex)을 그대로 쓴다.
+            law_collection=law_collection,
+            admrul_collection=os.getenv("ADMRUL_COLLECTION", law_collection),
+            schlpub_collection=os.getenv("SCHLPUB_COLLECTION", law_collection),
             search_text_tokenization=os.getenv("SEARCH_TEXT_TOKENIZATION", "kagome_kr").strip().lower(),
             embedding_model=os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3"),
             embedding_batch_size=int(os.getenv("EMBEDDING_BATCH_SIZE", "16")),
@@ -244,6 +254,7 @@ class Settings:
             doc_parser_endpoint_path=os.getenv("DOC_PARSER_ENDPOINT_PATH", "/run"),
             doc_parser_image_endpoint_path=os.getenv("DOC_PARSER_IMAGE_ENDPOINT_PATH", "")
             or os.getenv("DOC_PARSER_ENDPOINT_PATH", "/run"),
+            doc_parser_image_base_url=os.getenv("DOC_PARSER_IMAGE_BASE_URL") or None,
             doc_parser_api_key=os.getenv("DOC_PARSER_API_KEY") or None,
             doc_parser_upload=_bool("DOC_PARSER_UPLOAD", False),
             doc_parser_timeout=float(os.getenv("DOC_PARSER_TIMEOUT", "60")),

@@ -1,6 +1,6 @@
 {
   "class": "LegalProvisionIndex",
-  "description": "법령(법률·시행령·시행규칙 = LAW 레포) 조문/부칙/별표/개정문/파일 청크. self-provided vector(외부 임베딩 주입, vectorizer none) · HNSW cosine · BM25(b=0.75, k1=1.2)는 search_text 단일 속성(kagome_kr 한국어 형태소 — Weaviate 에 ENABLE_TOKENIZER_KAGOME_KR 모듈 필요) · 필터(indexFilterable) 18 · 키워드검색 1 · 표시 16 · 총 35 속성. 세 컬렉션(법령/행정규칙/학칙공단)이 같은 속성을 공유하고 클래스 이름만 다르다(데이터 레포당 컬렉션 하나).",
+  "description": "법령·행정규칙·학칙공단(LAW·ADMRUL·SCHLPUBRUL 레포 통합) 조문/부칙/별표/개정문/파일 청크. self-provided vector(외부 임베딩 주입, vectorizer none) · HNSW cosine · BM25(b=0.75, k1=1.2)는 search_text 단일 속성(kagome_kr 한국어 형태소 — Weaviate 에 ENABLE_TOKENIZER_KAGOME_KR 모듈 필요) · 필터(indexFilterable) 18 · 키워드검색 1 · 표시 16 · 총 35 속성. 세 컬렉션(법령/행정규칙/학칙공단)이 같은 속성을 공유하고 클래스 이름만 다르다(데이터 레포당 컬렉션 하나).",
   "vectorizer": "none",
   "vectorIndexType": "hnsw",
   "vectorIndexConfig": {
@@ -201,7 +201,7 @@
     },
     {
       "name": "domain",
-      "description": "필터 · law/admrul/schlpub — 데이터 레포·컬렉션과 1:1",
+      "description": "필터 · law/admrul/schlpub — 한 컬렉션 안의 코퍼스 구분자. 도메인별 검색은 이 필터로 하고, 삭제 연산도 이 값으로 범위를 가둔다",
       "dataType": [
         "text"
       ],
