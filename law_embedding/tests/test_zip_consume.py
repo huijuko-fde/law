@@ -49,6 +49,14 @@ class _Vdb:
             def delete_stale_law_chunks(self, law_id, keep_version_uids, collection):
                 return 0
 
+            def current_versions(self, law_id, collection):
+                out, seen = [], set()
+                for obj in vdb.upserted:
+                    if obj.law_id == law_id and obj.version_uid not in seen:
+                        seen.add(obj.version_uid)
+                        out.append({"version_uid": obj.version_uid, "mst": obj.mst})
+                return out
+
             def upsert(self, objects, dimension, model_name, collection):
                 if vdb.fail_upserts:
                     vdb.fail_upserts -= 1
@@ -483,3 +491,46 @@ def test_crash_before_archive_finishes_move_only(inbox, vdb, settings, monkeypat
 
     assert (summary["done"], summary["duplicate"]) == (1, 0) and vdb.upsert_calls == 1
     assert (inbox / "done" / "0001_batch.zip").exists() and not (inbox / "duplicate").exists()
+
+
+# ── 재전송·갱신 규칙 (LAW-28) ─────────────────────────────────────────────
+#
+# 재전송은 갱신이다. 단 옛 버전이 나중에 오면 최신판을 되돌리지 않고 그 법령만 건너뛴다(실패 아님).
+# 품질 가드(LAW-48)는 증분 경로에도 걸려야 한다 — 적재는 되돌리지 않되 결과·종료코드에 드러난다.
+
+def test_older_version_resend_does_not_overwrite_newer(inbox, vdb, settings):
+    _write_zip(inbox / "0002_batch.zip", {"law/형법/형법.json": _law("001692", "형법", version="2")})
+    summary = _run(settings, inbox)
+    assert summary["done"] == 1 and vdb.versions("001692") == ["001692:2:20260101"]
+
+    _write_zip(inbox / "0003_resend_old.zip", {"law/형법/형법.json": _law("001692", "형법", version="1")})
+    summary = _run(settings, inbox)
+    assert summary["done"] == 1 and summary["version_skipped"] == 1 and _failure_code(summary) == 0
+    assert summary["zips"][0]["version_skipped"] == 1
+    assert vdb.versions("001692") == ["001692:2:20260101"]            # v1 은 들어가지 않았다
+    sha = _sha(inbox / "done" / "0003_resend_old.zip")
+    assert _state(inbox, sha)["summary"]["version_skipped_laws"][0]["incoming"] == "001692:1:20260101"
+
+
+def test_quality_guard_surfaces_in_summary_and_exit_code(inbox, vdb, settings, monkeypatch):
+    """적재 중 품질 가드가 걸리면 ZIP 은 done 이지만 요약·이력·종료코드가 그것을 말한다."""
+    zip_path = _write_zip(inbox / "0001_batch.zip", {"law/형법/형법.json": _law("001692", "형법")})
+    sha = _sha(zip_path)
+    real = zip_consume.consume_folder
+
+    def tainted(*args, **kwargs):
+        from law_indexer.preprocess import note_quality
+        note_quality("chunks_seen", 100)
+        note_quality("chunks_dropped_empty", 1)
+        note_quality("dropped_real_chars", 40)        # 버린 청크에 내용이 있었다 — 필터 오작동 신호
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(zip_consume, "consume_folder", tainted)
+    summary = _run(settings, inbox)
+    assert summary["done"] == 1 and vdb.upsert_calls == 1              # 적재분은 되돌리지 않는다
+    assert summary["quality_guard"][0]["zip"] == "0001_batch.zip"
+    assert summary["quality_guard"][0]["reason"] == "dropped_chunks_had_content"
+    assert _failure_code(summary) == 2
+    record = _state(inbox, sha)
+    assert record["summary"]["quality_guard"]["reason"] == "dropped_chunks_had_content"
+    assert any(i["code"] == "quality_guard" for i in record["issues"])

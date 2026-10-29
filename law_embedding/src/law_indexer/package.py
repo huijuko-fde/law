@@ -420,6 +420,8 @@ class _Context:
     # 적재 범위(관리 화면 목록). None 이면 필터 없음 — 수집은 전량 유지하고 적재만 좁힌다.
     scope: Optional[LawScope] = None
     mirror: Optional[RepoMirror] = None           # C 옵션 — 데이터 레포 repo 레이아웃 최신화
+    # 저장된 것보다 옛 버전도 적재(최신판을 일부러 되돌릴 때 — 수동 복구 전용). 자동 경로는 항상 False.
+    allow_older_version: bool = False
 
 
 class RepoMirrorSet:
@@ -486,6 +488,61 @@ def _law_meta(payload: Optional[dict], fallback_law_id: str) -> dict:
     meta["adm_uid"] = payload.get("adm_uid")
     meta["git_path"] = payload.get("git_path")
     return meta
+
+
+def version_rank(version_uid: Optional[str], mst: Optional[str]) -> tuple:
+    """버전 신구 비교 키 — (version_uid 끝의 날짜 8자리, mst 정수).
+
+    법령은 (시행일, MST), 행정규칙은 (개정일, 일련번호) — 둘 다 법제처가 개정마다 올리는 값이라 외부
+    정보 없이 비교된다. 파싱 못 하면 0 이라 '모르는 쪽'은 항상 옛것으로 친다."""
+    tail = (version_uid or "").rsplit(":", 1)[-1].replace("-", "")
+    date_match = re.search(r"\d{8}", tail)
+    number_match = re.search(r"\d+", str(mst or ""))
+    return (int(date_match.group(0)) if date_match else 0,
+            int(number_match.group(0)) if number_match else 0)
+
+
+def _older_than_stored(store, law_id: str, law_meta: dict, collection: str) -> Optional[dict]:
+    """저장된 버전 중 들어온 것보다 새 것이 있으면 그 정보를, 없으면 None.
+
+    옛 ZIP 재전송·실패분 재투입이 최신판을 과거로 되돌리는 것을 막는다 — delete_stale_law_chunks 는
+    신구를 보지 않고 '이번 버전이 아닌 것'을 지우기 때문이다. 조회 1회(법 단위)로 임베딩 전에 끊는다."""
+    lookup = getattr(store, "current_versions", None)
+    if lookup is None:                               # 메서드가 없는 store(테스트 fake) — 가드 없이 진행
+        return None
+    incoming = version_rank(law_meta.get("version_uid"), law_meta.get("mst"))
+    newer = [v for v in lookup(law_id, collection)
+             if version_rank(v.get("version_uid"), v.get("mst")) > incoming]
+    if not newer:
+        return None
+    return {"law_id": law_id, "incoming": law_meta.get("version_uid"),
+            "stored": [v.get("version_uid") for v in newer]}
+
+
+def _delete_orphans(store, law_id: str, version_uid: Optional[str], objects: List[LegalProvision],
+                    collection: str, totals: dict) -> None:
+    """같은 버전 안의 고아 청크 정리 — 수정본 재전송으로 조문·청크가 줄면 옛 청크가 남는다.
+
+    초기 적재 경로(pipeline._embed_and_store)가 하던 정리를 증분에도 건다. JSON 은 버전 단위로,
+    FILE 은 이번에 처리한 file_id 단위로만 — 아직 안 온 첨부(pending)의 청크는 건드리지 않는다."""
+    json_fn = getattr(store, "delete_orphan_json_chunks", None)
+    file_fn = getattr(store, "delete_orphan_file_chunks", None)
+    removed = 0
+    try:
+        json_ids = [o.chunk_id for o in objects if o.source_type == "JSON"]
+        if json_fn and json_ids and version_uid:
+            removed += json_fn(law_id, version_uid, json_ids, collection)
+        if file_fn:
+            by_file: Dict[str, List[str]] = {}
+            for o in objects:
+                if o.source_type == "FILE" and o.file_id:
+                    by_file.setdefault(o.file_id, []).append(o.chunk_id)
+            for file_id, ids in by_file.items():
+                removed += file_fn(file_id, ids, collection)
+    except Exception as exc:
+        totals["errors"].append({"law_id": law_id, "error": f"고아 청크 정리 실패(무시): {exc}"})
+    if removed:
+        totals["orphans_removed"] = totals.get("orphans_removed", 0) + removed
 
 
 def _attachment_input(law_meta: dict, source: str, file_id: str, file_meta: dict,
@@ -811,6 +868,21 @@ def _flush_law(ctx: _Context, store, embedder: LocalEmbedder, buffer: _LawBuffer
         totals["scope_matched"] += 1
 
     law_meta = _law_meta(buffer.document, law_id)
+
+    # 버전 가드 — 저장된 것보다 옛 버전이면 적재도, 옛 버전 정리도 하지 않는다(최신판 보호).
+    #   조회가 안 되면 가드 없이 적재하는 쪽이 더 위험하므로 이 법은 실패로 두고 package 재시도에 맡긴다.
+    if not ctx.allow_older_version:
+        try:
+            older = _older_than_stored(store, law_id, law_meta, ctx.collection)
+        except Exception as exc:
+            totals["laws_failed"] += 1
+            totals["errors"].append({"law_id": law_id, "error": f"저장된 버전 조회 실패: {exc}"})
+            return
+        if older:
+            totals["version_skipped"] = totals.get("version_skipped", 0) + 1
+            totals.setdefault("version_skipped_laws", []).append(older)
+            return
+
     git_path = buffer.document_git_path or f"package:{law_id}"
     law_meta["git_path"] = law_meta.get("git_path") or buffer.document_git_path
     objects: List[LegalProvision] = []
@@ -880,6 +952,7 @@ def _flush_law(ctx: _Context, store, embedder: LocalEmbedder, buffer: _LawBuffer
                         totals["stale_removed"] = totals.get("stale_removed", 0) + removed
                 except Exception as exc:
                     totals["errors"].append({"law_id": law_id, "error": f"옛 버전 청크 정리 실패(무시): {exc}"})
+                _delete_orphans(store, law_id, law_meta.get("version_uid"), objects, ctx.collection, totals)
         # 이 법의 문서+파일을 미러에 다 쓴 뒤 커밋(push 모드일 때만). 메시지는 수집기와 동일.
         if ctx.mirror is not None and ctx.mirror.commit(buffer.commit_message):
             totals["mirror_commits"] = totals.get("mirror_commits", 0) + 1
@@ -1034,7 +1107,8 @@ def _apply_rename(ctx: _Context, routed: "_RoutedStores", settings: Settings,
 def consume_package(store, embedder: LocalEmbedder, settings: Settings, package_path: Path,
                     source_override: Optional[str] = None,
                     doc_parser: Optional[DocParserClient] = None,
-                    scope: Optional[LawScope] = None) -> dict:
+                    scope: Optional[LawScope] = None,
+                    allow_older_version: bool = False) -> dict:
     """JSONL package를 소비해 Weaviate에 적재한다.
 
     - source는 package_header의 source를 우선하고, 없으면 source_override(CLI --source)를 쓴다.
@@ -1095,7 +1169,7 @@ def consume_package(store, embedder: LocalEmbedder, settings: Settings, package_
         preprocess_files=settings.package_preprocess_files,
         inbox_dir=settings.package_file_inbox_dir,
         delete_consumed_files=settings.package_delete_consumed_files,
-        mirror=mirror,
+        mirror=mirror, allow_older_version=allow_older_version,
         doc_parser=doc_parser or (DocParserClient(
             settings.doc_parser_base_url, settings.doc_parser_timeout, settings.doc_parser_max_retries,
             endpoint_path=settings.doc_parser_endpoint_path, api_key=settings.doc_parser_api_key,

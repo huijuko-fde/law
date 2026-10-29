@@ -7,6 +7,7 @@ import dataclasses
 import json
 from pathlib import Path
 
+from law_indexer import package
 from law_indexer.config import Settings
 from law_indexer.law_scope import parse_scope
 from law_indexer.package import consume_package, is_package_file
@@ -20,6 +21,9 @@ class FakeStore:
         self.deleted = []          # delete_by_law_id (폐지 전량삭제) 로 넘어온 law_id
         self.stale = []            # delete_stale_law_chunks (upsert 후 옛 버전 정리) (law_id, keep)
         self.upserted = []         # upsert 된 LegalProvision 목록들
+        self.versions = {}         # law_id → [{version_uid, mst}] — current_versions 가 돌려줄 저장 상태
+        self.orphan_json = []      # delete_orphan_json_chunks (law_id, version_uid, keep)
+        self.orphan_file = []      # delete_orphan_file_chunks (file_id, keep)
 
     def delete_by_law_id(self, law_id, collection):
         self.deleted.append(law_id)
@@ -27,6 +31,17 @@ class FakeStore:
 
     def delete_stale_law_chunks(self, law_id, keep_version_uids, collection):
         self.stale.append((law_id, set(keep_version_uids)))
+        return 0
+
+    def current_versions(self, law_id, collection):
+        return list(self.versions.get(law_id, []))
+
+    def delete_orphan_json_chunks(self, law_id, version_uid, keep_chunk_ids, collection):
+        self.orphan_json.append((law_id, version_uid, set(keep_chunk_ids)))
+        return 0
+
+    def delete_orphan_file_chunks(self, file_id, keep_chunk_ids, collection):
+        self.orphan_file.append((file_id, set(keep_chunk_ids)))
         return 0
 
     def upsert(self, objects, dimension, model_name, collection):
@@ -154,6 +169,83 @@ def test_scope_out_of_list_repeal_with_content_still_deletes(tmp_path):
     totals = consume_package(store, embedder, Settings.from_env(), pkg, scope=_scope("법L1"))
     assert store.upserted == [] and store.deleted == ["L2"]
     assert totals["scope_skipped"] == 1
+
+
+# ── 버전 가드 · 같은 버전 고아 정리 (증분 재전송, LAW-28) ─────────────────
+#
+# 재전송은 갱신이다 — 단 저장된 것보다 옛 버전이 나중에 오면 최신판을 과거로 되돌리면 안 된다.
+# delete_stale_law_chunks 는 신구를 보지 않으므로 적재 전에 비교해 끊는다.
+
+def _versioned(law_id, version, date="20240101"):
+    p = _law_payload(law_id)
+    p["mst"] = str(version)
+    p["version_uid"] = f"{law_id}:{version}:{date}"
+    return p
+
+
+def _consume_one(tmp_path, store, payload, **kw):
+    pkg = _write(tmp_path, _header(),
+                 {"record_type": "document", "op": "upsert", "law_id": payload["law_id"], "payload": payload})
+    return consume_package(store, FakeEmbedder(), Settings.from_env(), pkg, **kw)
+
+
+def test_older_version_is_skipped_and_newer_kept(tmp_path):
+    """저장된 것보다 옛 버전은 적재도 옛 버전 정리도 하지 않는다 — 최신판 보호. 실패가 아니라 기록."""
+    store = FakeStore()
+    store.versions["L1"] = [{"version_uid": "L1:2:20250101", "mst": "2"}]
+    totals = _consume_one(tmp_path, store, _versioned("L1", 1))
+    assert store.upserted == [] and store.stale == []
+    assert totals["version_skipped"] == 1
+    assert totals["version_skipped_laws"][0]["stored"] == ["L1:2:20250101"]
+    assert not [e for e in totals["errors"] if "버전" in e.get("error", "")]   # 실패가 아니다
+
+
+def test_newer_version_replaces_stored(tmp_path):
+    store = FakeStore()
+    store.versions["L1"] = [{"version_uid": "L1:1:20240101", "mst": "1"}]
+    totals = _consume_one(tmp_path, store, _versioned("L1", 2, "20250101"))
+    assert [o.version_uid for o in _flat(store.upserted)] == ["L1:2:20250101"]
+    assert store.stale == [("L1", {"L1:2:20250101"})]
+    assert "version_skipped" not in totals
+
+
+def test_version_rank_compares_date_then_number():
+    """시행일(개정일)이 먼저, MST(일련번호)가 다음. ISO 날짜도 읽고, 모르면 (0, 0) = 옛것."""
+    assert package.version_rank("L1:5:20250101", "5") > package.version_rank("L1:9:20240101", "9")
+    assert package.version_rank("admrul:37584:2026-10-02", "2100000285778") == (20261002, 2100000285778)
+    assert package.version_rank(None, None) == (0, 0)
+
+
+def test_same_version_updates_in_place_and_removes_orphans(tmp_path):
+    """같은 버전 재전송(수정본) — 제자리 덮어쓰기 + 이번 결과에 없는 같은 버전 청크 정리."""
+    store = FakeStore()
+    store.versions["L1"] = [{"version_uid": "L1:1:20240101", "mst": "1"}]
+    _consume_one(tmp_path, store, _versioned("L1", 1))
+    objs = _flat(store.upserted)
+    assert len(objs) == 1
+    assert store.orphan_json == [("L1", "L1:1:20240101", {objs[0].chunk_id})]
+
+
+def test_allow_older_version_overrides_guard(tmp_path):
+    """수동 복구 전용 — 켜면 옛 버전도 들어간다(최신판을 일부러 되돌릴 때)."""
+    store = FakeStore()
+    store.versions["L1"] = [{"version_uid": "L1:2:20250101", "mst": "2"}]
+    totals = _consume_one(tmp_path, store, _versioned("L1", 1), allow_older_version=True)
+    assert [o.version_uid for o in _flat(store.upserted)] == ["L1:1:20240101"]
+    assert "version_skipped" not in totals
+
+
+def test_version_lookup_failure_fails_the_law(tmp_path):
+    """저장된 버전을 못 읽으면 가드 없이 적재하지 않는다 — 그 법은 실패(package 재시도)."""
+    store = FakeStore()
+
+    def boom(law_id, collection):
+        raise RuntimeError("weaviate 연결 끊김")
+
+    store.current_versions = boom
+    totals = _consume_one(tmp_path, store, _versioned("L1", 1))
+    assert store.upserted == [] and totals["laws_failed"] == 1
+    assert "저장된 버전 조회 실패" in totals["errors"][0]["error"]
 
 
 # ── record_type 별 ──────────────────────────────────────────────────────

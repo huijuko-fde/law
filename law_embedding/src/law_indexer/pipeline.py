@@ -522,7 +522,8 @@ def _fail_or_retry(claimed: Path, original: Path, name: str, folder: Path,
 def consume_folder(embedder: LocalEmbedder, settings: Settings, folder: Path, *,
                    processed_dir: Optional[Path] = None, failed_dir: Optional[Path] = None,
                    source_override: Optional[str] = None, pattern: str = "*.jsonl",
-                   nack_dir: Optional[Path] = None, scope=None) -> dict:
+                   nack_dir: Optional[Path] = None, scope=None,
+                   allow_older_version: bool = False) -> dict:
     """폴더에 도착한 package(*.jsonl)들을 오래된 순서로 **안전하게** 소비한다(스트리밍 소비자).
 
     안전장치:
@@ -595,7 +596,7 @@ def consume_folder(embedder: LocalEmbedder, settings: Settings, folder: Path, *,
 
             try:
                 result = consume_package(store, embedder, settings, claimed, source_override=source,
-                                         scope=scope)
+                                         scope=scope, allow_older_version=allow_older_version)
             except Exception as exc:                    # 예상외 예외 = 일시장애로 간주 → 재시도
                 _fail_or_retry(claimed, pkg, name, folder, failed_dir,
                                [{"error": str(exc)}], summary, transient=True,
@@ -614,7 +615,9 @@ def consume_folder(embedder: LocalEmbedder, settings: Settings, folder: Path, *,
                 summary["ok"] += 1
                 summary["packages"].append({"package": name, "status": "ok",
                                             "documents": result.get("documents"),
-                                            "objects": result.get("objects_success")})
+                                            "objects": result.get("objects_success"),
+                                            "version_skipped": result.get("version_skipped", 0),
+                                            "version_skipped_laws": result.get("version_skipped_laws") or []})
     finally:
         for store in stores.values():
             try:

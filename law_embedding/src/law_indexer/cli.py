@@ -51,6 +51,8 @@ def _failure_code(result) -> int:
         return 2
     if result.get("partial"):                      # consume-zip 요약 — 일부 문서 거부(나머지는 적재)
         return 2
+    if result.get("quality_guard"):                # 품질 가드(LAW-48) — 적재는 됐지만 후속 단계는 막는다
+        return 2
     for k in ("files_failed", "objects_failed", "attachments_failed", "laws_failed"):
         if result.get(k):
             return 2
@@ -155,6 +157,9 @@ def parser() -> argparse.ArgumentParser:
                     help="격리 시 생산자에 되돌릴 목록을 남길 폴더(기본 PACKAGE_NACK_DIR 또는 <dir>/nack). "
                          "수집기의 PACKAGE_NACK_DIR 과 같은 경로여야 재발송/재수집이 걸린다")
     cf.add_argument("--source", choices=_SOURCES, default=None, help="header 에 source 없을 때만")
+    cf.add_argument("--allow-older-version", action="store_true",
+                    help="저장된 것보다 옛 버전도 적재한다(최신판을 일부러 되돌릴 때 — 수동 복구 전용). "
+                         "기본은 옛 버전을 건너뛰어 최신 데이터를 보호한다")
 
     cz = sub.add_parser("consume-zip",
                         help="폴더에 도착한 법령 ZIP(*.zip)을 파일명 순서로 package 변환 → consume-folder 경로로 적재 "
@@ -166,6 +171,8 @@ def parser() -> argparse.ArgumentParser:
                          "규칙(processed/·failed/·nack/)으로 소비한다")
     cz.add_argument("--nack", type=Path,
                     help="consume-folder --nack 과 같다(기본 PACKAGE_NACK_DIR 또는 <package-dir>/nack)")
+    cz.add_argument("--allow-older-version", action="store_true",
+                    help="consume-folder --allow-older-version 과 같다(수동 복구 전용)")
 
     search = sub.add_parser("search")
     search.add_argument("--query", required=True)
@@ -439,14 +446,16 @@ def main(argv=None):
                 failed = args.failed or (args.dir / "failed")
                 result = consume_folder(embedder, settings, args.dir, processed_dir=processed,
                                         failed_dir=failed, source_override=args.source,
-                                        nack_dir=args.nack, scope=load_law_scope())
+                                        nack_dir=args.nack, scope=load_law_scope(),
+                                        allow_older_version=args.allow_older_version)
                 print(json.dumps(result, ensure_ascii=False, indent=2))
                 raise SystemExit(_failure_code(result))
 
             if args.command == "consume-zip":
                 # ZIP → package(첨부는 file_transfer) → 기존 consume_folder 로 적재. 처리 이력은 <dir>/state.
                 result = consume_zip_folder(embedder, settings, args.dir, package_dir=args.package_dir,
-                                            nack_dir=args.nack, scope=load_law_scope())
+                                            nack_dir=args.nack, scope=load_law_scope(),
+                                            allow_older_version=args.allow_older_version)
                 print(json.dumps(result, ensure_ascii=False, indent=2))
                 raise SystemExit(_failure_code(result))
 

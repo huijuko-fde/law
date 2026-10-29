@@ -546,6 +546,24 @@ class WeaviateStore(AbstractContextManager):
             if not got:                                    # 방어 — 진전 없으면 무한루프 방지
                 return removed
 
+    def current_versions(self, law_id: str, collection: str) -> List[dict]:
+        """이 law_id 로 저장된 버전들 — [{version_uid, mst}] (중복 제거). 적재 전 신구 비교용
+        (package._older_than_stored). 한 법은 보통 한 버전만 있지만(옛 버전은 적재 후 정리) 정리가
+        실패해 둘이 남을 수 있어 전부 돌려준다. 객체 500개까지만 훑는다 — 두 버전이 공존하고 한쪽이
+        500개를 넘는 극단에선 뒤 버전을 놓칠 수 있다."""
+        from weaviate.classes.query import Filter
+        coll = self.client.collections.get(collection)
+        result = coll.query.fetch_objects(
+            filters=self._scoped(Filter.by_property("law_id").equal(law_id)),
+            limit=500, return_properties=["version_uid", "mst"])
+        seen, out = set(), []
+        for obj in result.objects:
+            vuid = obj.properties.get("version_uid")
+            if vuid and vuid not in seen:
+                seen.add(vuid)
+                out.append({"version_uid": vuid, "mst": obj.properties.get("mst")})
+        return out
+
     def has_chunks(self, law_id: str, collection: str) -> bool:
         """이 law_id 로 이미 적재된 청크가 하나라도 있는지 — 이어받기(--skip-existing) 판단용.
 

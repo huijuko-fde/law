@@ -33,7 +33,8 @@ from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
 
 from .config import Settings
-from .pipeline import consume_folder
+from .pipeline import consume_folder, finish_quality
+from .preprocess import reset_quality
 from .zip_intake import (Issue, ZipIntakeError, ZipIntakeResult, flatten_nested_zips,
                          read_zip, write_packages)
 
@@ -63,11 +64,12 @@ class _Run:
     settings: Settings              # 소비용 — package_file_inbox_dir 를 files 로 맞춘 것
     nack_dir: Optional[Path]
     scope: object
+    allow_older_version: bool = False   # 수동 복구 전용 — package.consume_package 참고
 
 
 def consume_zip_folder(embedder, settings: Settings, folder: Path, *,
                        package_dir: Optional[Path] = None, nack_dir: Optional[Path] = None,
-                       scope=None) -> dict:
+                       scope=None, allow_older_version: bool = False) -> dict:
     """수신 폴더의 `*.zip` 을 파일명 순서로 처리한다. 반환: 실행 요약(ZIP 별 결과 포함).
 
     처리 대상은 폴더 바로 아래 `*.zip` 뿐이다(점으로 시작하는 임시 파일·manifest·기타는 보지 않는다).
@@ -84,12 +86,13 @@ def consume_zip_folder(embedder, settings: Settings, folder: Path, *,
     run = _Run(inbox=folder, state=folder / "state", done=folder / "done", failed=folder / "failed",
                duplicate=folder / "duplicate", packages=packages, files=files, embedder=embedder,
                settings=dataclasses.replace(settings, package_file_inbox_dir=files),
-               nack_dir=nack_dir, scope=scope)
+               nack_dir=nack_dir, scope=scope, allow_older_version=allow_older_version)
     for path in (run.state, run.packages, run.files):
         path.mkdir(parents=True, exist_ok=True)
 
     summary = {"folder": str(folder), "package_dir": str(packages), "total": 0, "done": 0,
-               "partial": 0, "failed": 0, "duplicate": 0, "waiting": 0, "deferred": 0, "zips": []}
+               "partial": 0, "failed": 0, "duplicate": 0, "waiting": 0, "deferred": 0,
+               "version_skipped": 0, "quality_guard": [], "zips": []}
     with _exclusive(run.state) as acquired:
         if not acquired:
             summary["skipped"] = "다른 consume-zip 실행이 이 폴더를 처리 중입니다"
@@ -99,6 +102,9 @@ def consume_zip_folder(embedder, settings: Settings, folder: Path, *,
         for index, zip_path in enumerate(zips):
             outcome = _process(run, zip_path)
             summary[_SUMMARY_KEYS[outcome["status"]]] += 1
+            summary["version_skipped"] += outcome.get("version_skipped") or 0
+            if outcome.get("quality_guard"):
+                summary["quality_guard"].append({"zip": outcome["zip"], **outcome["quality_guard"]})
             summary["zips"].append(outcome)
             if outcome["status"] == LOADING:
                 summary["deferred"] = len(zips) - index - 1
@@ -213,9 +219,24 @@ def _load(run: _Run, record: dict) -> None:
     sweep 요약만 보면 다른 소비자(스케줄된 consume-folder 등)가 먼저 가져간 package 를 놓친다 — 위치는
     누가 소비했든 같은 규칙(processed/·failed/·제자리=재시도 대기)을 따른다."""
     processed, failed = run.packages / "processed", run.packages / "failed"
+    # 품질 가드(LAW-48)를 이 sweep 에 건다 — 패딩 압축·빈 청크 제거 같은 자동 처리가 잘못돼도 티가
+    # 나지 않으므로 sweep 단위로 세어 ZIP 기록에 싣는다. 적재분은 되돌리지 않는다(finish_quality).
+    reset_quality()
     sweep = consume_folder(run.embedder, run.settings, run.packages, processed_dir=processed,
-                           failed_dir=failed, nack_dir=run.nack_dir, scope=run.scope)
+                           failed_dir=failed, nack_dir=run.nack_dir, scope=run.scope,
+                           allow_older_version=run.allow_older_version)
+    quality = finish_quality({})
+    summary = record.setdefault("summary", {})
+    summary["quality"] = quality.get("quality") or {}
+    if quality.get("quality_guard"):
+        summary["quality_guard"] = quality["quality_guard"]
+        record.setdefault("issues", []).extend(_dicts(
+            [Issue("error", "quality_guard", quality["quality_guard"].get("message") or "")]))
     by_name = {entry.get("package"): entry for entry in sweep.get("packages") or []}
+    skipped = [entry for entry in by_name.values() if entry.get("version_skipped")]
+    if skipped:                                        # 옛 버전 재전송 — 보호가 작동한 것(실패 아님). 기록만.
+        summary["version_skipped"] = sum(e["version_skipped"] for e in skipped)
+        summary["version_skipped_laws"] = [law for e in skipped for law in e.get("version_skipped_laws") or []]
     for item in record["packages"]:
         name = item["name"]
         if (run.packages / name).exists() or (run.packages / (name + ".processing")).exists():
@@ -374,6 +395,8 @@ def _outcome(record: dict) -> dict:
             "rejected": summary.get("rejected", 0), "files": summary.get("files", 0),
             "issue_errors": sum(1 for issue in issues if issue.get("level") == "error"),
             "issue_warnings": sum(1 for issue in issues if issue.get("level") == "warning"),
+            "version_skipped": summary.get("version_skipped", 0),
+            "quality_guard": summary.get("quality_guard"),
             "packages": [{"name": p["name"], "status": p["status"]} for p in record.get("packages") or []]}
 
 
