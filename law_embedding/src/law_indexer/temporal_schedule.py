@@ -6,35 +6,68 @@
 일시정지된다. **일시정지 = HALT** 이고, 해제는 unpause + trigger 다. 실행 이력·결과·실패 사유는 전부 Temporal
 서버에 남아 `/temporal` UI 와 이 모듈의 조회 함수로 본다.
 """
+import os
 from datetime import timedelta
 from typing import List, Optional
 
 from temporalio.client import (Client, Schedule, ScheduleActionStartWorkflow, ScheduleAlreadyRunningError,
                                ScheduleHandle, ScheduleOverlapPolicy, SchedulePolicy, ScheduleSpec,
-                               WorkflowExecutionStatus, WorkflowFailureError)
+                               ScheduleUpdate, ScheduleUpdateInput, WorkflowExecutionStatus,
+                               WorkflowFailureError)
 
 from .worker_workflows import LawInboxRequest, LawInboxWorkflow
 
 SCHEDULE_ID = "law-inbox"
 WORKFLOW_TYPE = "LawInboxWorkflow"
+# 한 실행의 상한. 워커가 죽어 Running 에 고착된 실행이 overlap=SKIP 으로 뒤 실행을 영원히 막지 않게 —
+# 타임아웃도 실패라 pause_on_failure 로 일시정지(HALT)돼 사람 눈에 띈다.
+RUN_TIMEOUT_HOURS = int(os.getenv("LAW_RUN_TIMEOUT_HOURS", "12"))
+
+
+def definition(*, task_queue: str, req: LawInboxRequest, cron: str, tz: str = "Asia/Seoul",
+               schedule_id: str = SCHEDULE_ID) -> Schedule:
+    """Schedule 정의 한 곳 — 생성과 갱신이 같은 것을 쓴다."""
+    return Schedule(
+        action=ScheduleActionStartWorkflow(LawInboxWorkflow.run, req, id=f"{schedule_id}-run",
+                                           task_queue=task_queue,
+                                           run_timeout=timedelta(hours=RUN_TIMEOUT_HOURS)),
+        spec=ScheduleSpec(cron_expressions=[cron], time_zone_name=tz),
+        policy=SchedulePolicy(overlap=ScheduleOverlapPolicy.SKIP,
+                              catchup_window=timedelta(hours=1), pause_on_failure=True),
+    )
 
 
 async def ensure_schedule(client: Client, *, task_queue: str, req: LawInboxRequest, cron: str,
                           tz: str = "Asia/Seoul", schedule_id: str = SCHEDULE_ID) -> ScheduleHandle:
-    """없으면 만들고 있으면 그대로 쓴다 — 기존 Schedule(사람이 바꿨을 수 있다)은 덮어쓰지 않는다."""
+    """없으면 만들고, 있으면 action·spec·policy 를 현재 설정으로 **갱신**한다(일시정지·메모 등 state 는 보존).
+
+    Schedule 은 등록 때의 LAW_ROOT·큐·cron 을 스냅샷으로 박아 두므로, 갱신하지 않으면 env 를 바꿔
+    재배포해도 옛 값으로 계속 돈다 — 옛 root 를 빈 채로 훑으며 매번 ok 를 내는 조용한 정지."""
+    sched = definition(task_queue=task_queue, req=req, cron=cron, tz=tz, schedule_id=schedule_id)
     try:
-        return await client.create_schedule(
-            schedule_id,
-            Schedule(
-                action=ScheduleActionStartWorkflow(LawInboxWorkflow.run, req, id=f"{schedule_id}-run",
-                                                   task_queue=task_queue),
-                spec=ScheduleSpec(cron_expressions=[cron], time_zone_name=tz),
-                policy=SchedulePolicy(overlap=ScheduleOverlapPolicy.SKIP,
-                                      catchup_window=timedelta(hours=1), pause_on_failure=True),
-            ),
-        )
+        return await client.create_schedule(schedule_id, sched)
     except ScheduleAlreadyRunningError:
-        return client.get_schedule_handle(schedule_id)
+        handle = client.get_schedule_handle(schedule_id)
+
+        def _update(inp: ScheduleUpdateInput) -> ScheduleUpdate:
+            sched.state = inp.description.schedule.state          # 사람이 건 일시정지·메모는 그대로
+            return ScheduleUpdate(schedule=sched)
+
+        await handle.update(_update)
+        return handle
+
+
+def _calendar_text(spec) -> List[str]:
+    """서버는 cron 문자열을 calendar 로 정규화해 돌려준다(describe 의 cron_expressions 는 늘 빈 목록) — 사람이
+    읽을 수 있게 복원한다."""
+    def rng(items) -> str:
+        parts = []
+        for r in items or []:
+            s = f"{r.start}" if r.start == r.end else f"{r.start}-{r.end}"
+            parts.append(s + (f"/{r.step}" if getattr(r, "step", 1) and r.step > 1 else ""))
+        return ",".join(parts) or "*"
+    return [f"minute={rng(c.minute)} hour={rng(c.hour)} dow={rng(c.day_of_week)} dom={rng(c.day_of_month)}"
+            for c in (spec.calendars or [])]
 
 
 async def describe(client: Client, schedule_id: str = SCHEDULE_ID) -> dict:
@@ -44,7 +77,7 @@ async def describe(client: Client, schedule_id: str = SCHEDULE_ID) -> dict:
         "schedule_id": schedule_id,
         "paused": state.paused,
         "note": state.note,
-        "cron": list(spec.cron_expressions),
+        "cron": list(spec.cron_expressions) or _calendar_text(spec),
         "time_zone": spec.time_zone_name,
         "next_run_at": [t.isoformat() for t in info.next_action_times[:3]],
         "running": [getattr(a, "workflow_id", None) for a in info.running_actions],
@@ -90,7 +123,12 @@ async def run_outcome(client: Client, workflow_id: str, run_id: Optional[str] = 
         cause = exc.cause
         details = list(getattr(cause, "details", None) or [])
         detail = details[0] if details and isinstance(details[0], dict) else {}
-        return {"status": status.name, "verdict": detail.get("verdict", "halt"), "message": str(cause),
+        # activity 실패는 ActivityError → ApplicationError 두 단계라 안쪽 원인까지 이어 붙인다.
+        chain, inner = [], cause
+        while inner is not None and len(chain) < 4:
+            chain.append(str(inner))
+            inner = getattr(inner, "cause", None) or getattr(inner, "__cause__", None)
+        return {"status": status.name, "verdict": detail.get("verdict", "halt"), "message": " ← ".join(chain),
                 **{k: v for k, v in detail.items() if k != "verdict"}}
     except Exception as exc:                       # 취소·강제 종료 등
         return {"status": status.name, "message": str(exc)}

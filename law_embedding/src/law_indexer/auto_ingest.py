@@ -28,9 +28,10 @@ import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional
 
-from .ingest_rules import HALT, OK, WAITING, decide, trim_report  # noqa: F401 — 판정 규칙은 ingest_rules 에
+from .ingest_rules import (HALT, OK, WAITING, decide, merge_reports,  # noqa: F401 — 판정 규칙은 ingest_rules 에
+                           merge_summaries, trim_report)
 
 log = logging.getLogger("law_embedding.ingest")
 
@@ -131,32 +132,63 @@ class IngestPaths:
                 self.converted / "packages" / "processed"]
 
 
-def requeue(paths: IngestPaths, name: str, stage: str) -> List[str]:
-    """실패분을 다시 줄에 세운다 — 파드가 옮기므로 사람이 파드 소유 폴더를 만질 필요가 없다.
+def _sha256(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
-    stage="convert": failed/<name>(+manifest) → 수신 폴더(변환부터 다시; 보고 파일은 지운다)
-    stage="consume": converted/failed/<name>(+manifest) → converted/(consume-zip 이 처음부터 다시;
-                     실패 이력은 막지 않는다 — zip_consume 참고)
+
+def _forget_consumed(paths: IngestPaths, name: str) -> List[str]:
+    """이미 소비가 끝난 변환본의 흔적(converted/done/<name> 과 state/<sha>.json)을 지운다 — 그대로 두면
+    재투입분이 같은 바이트라 duplicate 로 건너뛴다(VDB 재생성 뒤 같은 ZIP 을 다시 넣는 경로)."""
+    gone = []
+    done_zip = paths.converted / "done" / name
+    if done_zip.is_file():
+        state = paths.converted / "state" / f"{_sha256(done_zip)}.json"
+        for p in (state, done_zip, paths.manifest_of(done_zip)):
+            if p.exists():
+                p.unlink()
+                gone.append(str(p.relative_to(paths.root)))
+    return gone
+
+
+def requeue(paths: IngestPaths, name: str, stage: str) -> List[str]:
+    """실패분(또는 이미 처리한 것)을 다시 줄에 세운다 — 파드가 옮기므로 사람이 파드 소유 폴더를 만질 필요가 없다.
+
+    stage="convert": failed/ 또는 done/ 의 <name>(+manifest) → 수신 폴더(변환부터 다시; 보고 파일은 지운다).
+                     done/ 에서 꺼낼 때는 소비 흔적(converted/done·state)도 지워 duplicate 로 안 걸리게 한다.
+    stage="consume": converted/failed/ 또는 converted/done/ 의 <name>(+manifest) → converted/
+                     (consume-zip 이 처음부터 다시; done/ 에서 꺼내면 state 를 지운다)
     반환: 옮긴 파일 이름. 없으면 FileNotFoundError, stage 가 틀리면 ValueError."""
     name = Path(name).name
     if stage == "convert":
-        src_dir, dst_dir = paths.failed, paths.inbox
+        candidates, dst_dir = (paths.failed, paths.done), paths.inbox
     elif stage == "consume":
-        src_dir, dst_dir = paths.converted / "failed", paths.converted
+        candidates, dst_dir = (paths.converted / "failed", paths.converted / "done"), paths.converted
     else:
         raise ValueError(f"stage 는 convert|consume: {stage}")
+    src_dir = next((d for d in candidates if (d / name).is_file()), None)
+    if src_dir is None or not name.endswith(".zip"):
+        raise FileNotFoundError(f"{stage} 의 failed/·done/ 에 {name} 이 없습니다")
     zip_path = src_dir / name
-    if not zip_path.is_file() or not name.endswith(".zip"):
-        raise FileNotFoundError(f"{stage} 실패분에 {name} 이 없습니다")
     moved = []
+    if stage == "consume" and src_dir.name == "done":
+        state = paths.converted / "state" / f"{_sha256(zip_path)}.json"
+        if state.exists():
+            state.unlink()
     for p in (zip_path, paths.manifest_of(zip_path)):
         if p.exists():
             os.replace(p, dst_dir / p.name)
             moved.append(p.name)
+    if stage == "convert" and src_dir == paths.done:
+        _forget_consumed(paths, name)
     report = src_dir / f"{zip_path.stem}.convert-report.json"
     if report.exists():
         report.unlink()
-    log.info("[law-ingest] requeue stage=%s %s", stage, moved)
+    log.info("[law-ingest] requeue stage=%s from=%s %s", stage, src_dir.name, moved)
     return moved
 
 
@@ -208,37 +240,57 @@ def inbox_status(paths: IngestPaths) -> dict:
 
 
 def run_once(paths: IngestPaths, convert: Callable, consume: Callable, *, trigger: str = "manual",
-             halt_on_partial: bool = True) -> dict:
-    """변환 → 소비 → 판정 한 번. 예외도 기록(halt)으로 바꾼다 — 러너 스레드가 죽지 않는다.
+             halt_on_partial: bool = True, retries: int = 0, retry_wait_sec: int = 60) -> dict:
+    """변환 → 소비 → 판정 한 번. 예외는 retries 만큼 다시 해 보고(일시 장애 — admin-api 롤링 재시작·NFS 순간
+    오류) 그래도 안 되면 기록(halt)으로 바꾼다 — 러너 스레드가 죽지 않는다. 다시 할 때 앞선 시도의 변환·소비
+    보고를 합쳐 판정한다(시도 사이에 failed/ 로 옮겨진 ZIP 이 판정에서 빠지지 않게).
 
     convert(inbox, outbox, done_dir=, failed_dir=) -> 보고 list (inbox_convert.convert_inbox 모양)
     consume(folder) -> 요약 dict (zip_consume.consume_zip_folder 모양)"""
     record = {"trigger": trigger, "started_at": _now()}
-    try:
-        reports = convert(paths.inbox, paths.converted, done_dir=paths.done, failed_dir=paths.failed)
-        summary = consume(paths.converted)
-        verdict, reasons = decide(reports, summary, halt_on_partial=halt_on_partial)
-        record.update(convert=[trim_report(r) for r in reports], consume=summary, verdict=verdict, reasons=reasons)
-    except Exception as exc:
-        record.update(verdict=HALT, reasons=[f"exception:{type(exc).__name__}: {exc}"],
-                      traceback=traceback.format_exc())
+    report_attempts, summary_attempts = [], []
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            report_attempts.append(convert(paths.inbox, paths.converted, done_dir=paths.done, failed_dir=paths.failed))
+            summary_attempts.append(consume(paths.converted))
+            reports, summary = merge_reports(report_attempts), merge_summaries(summary_attempts)
+            verdict, reasons = decide(reports, summary, halt_on_partial=halt_on_partial)
+            record.update(convert=[trim_report(r) for r in reports], consume=summary, verdict=verdict,
+                          reasons=reasons, attempts=attempt)
+            break
+        except Exception as exc:
+            if attempt <= retries:
+                log.warning("[law-ingest] run attempt %d failed (%s: %s) — %ds 뒤 다시", attempt,
+                            type(exc).__name__, exc, retry_wait_sec)
+                time.sleep(retry_wait_sec)
+                continue
+            record.update(verdict=HALT, reasons=[f"exception:{type(exc).__name__}: {exc}"],
+                          traceback=traceback.format_exc(), attempts=attempt,
+                          convert=[trim_report(r) for r in merge_reports(report_attempts)],
+                          consume=merge_summaries(summary_attempts))
+            break
     record["finished_at"] = _now()
     return record
 
 
 def build_run_fn(paths: IngestPaths, embedder, settings, *, halt_on_partial: bool = True,
                  allow_older_version: bool = False) -> Callable[[str], dict]:
-    """실제 변환기·소비자를 묶은 run_fn(trigger) -> record. 적재 범위(law_scope)는 실행마다 새로 읽는다."""
+    """실제 변환기·소비자를 묶은 run_fn(trigger) -> record. 적재 범위(law_scope)는 실행마다 새로 읽는다.
+    LAW_RUN_RETRIES(2)·LAW_RUN_RETRY_WAIT_SEC(60): 예외 재시도 횟수·간격."""
     from .inbox_convert import convert_inbox
     from .law_scope import load_law_scope
     from .zip_consume import consume_zip_folder
+    retries = int(os.getenv("LAW_RUN_RETRIES", "2"))
+    wait = int(os.getenv("LAW_RUN_RETRY_WAIT_SEC", "60"))
 
     def consume(folder: Path) -> dict:
         return consume_zip_folder(embedder, settings, folder, scope=load_law_scope(),
                                   allow_older_version=allow_older_version)
 
     return lambda trigger: run_once(paths, convert_inbox, consume, trigger=trigger,
-                                    halt_on_partial=halt_on_partial)
+                                    halt_on_partial=halt_on_partial, retries=retries, retry_wait_sec=wait)
 
 
 def retire(paths: IngestPaths, retention_days: int, now: Optional[float] = None) -> dict:
@@ -250,6 +302,7 @@ def retire(paths: IngestPaths, retention_days: int, now: Optional[float] = None)
     cutoff = (now or time.time()) - retention_days * 86400
     targets = [p for d in paths.archives() if d.is_dir() for p in d.iterdir() if p.is_file()]
     targets += [p for p in paths.runs.glob("*.json") if p.name != "latest.json"]
+    targets += list((paths.runs / "attempts").glob("*.json"))      # activity 재시도 보고(worker._merge_attempts)
     for p in targets:
         try:
             st = p.stat()
@@ -275,7 +328,7 @@ class Runner:
     """실행 스레드 하나. trigger() 또는 interval 로 깨어나 sweep 한다. HALT 가 있으면 돌지 않는다."""
 
     def __init__(self, paths: IngestPaths, run_fn: Callable[[str], dict], *, interval_sec: int = 600,
-                 instance: Optional[str] = None, lease_ttl_sec: int = 900, retention_days: int = 30,
+                 instance: Optional[str] = None, lease_ttl_sec: int = 300, retention_days: int = 30,
                  manifest_grace_sec: int = 3600, expect_interval_hours: float = 0):
         self.paths, self.run_fn = paths, run_fn
         self.interval, self.lease_ttl = interval_sec, lease_ttl_sec

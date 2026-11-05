@@ -45,3 +45,45 @@ def test_collection_selector():
     s = Settings.from_env()
     assert worker._collection_for(s, "law") == s.law_collection
     assert worker._collection_for(s, "admrul") == s.admrul_collection
+
+
+def test_activity_attempt_reports_are_merged(tmp_path, monkeypatch):
+    """재시도된 activity 는 앞선 시도의 보고를 잃지 않는다 — 시도 사이에 failed/ 로 옮겨진 ZIP 이 판정에서
+    빠지면 실패가 ok 로 둔갑한다(2026-11-05 전체 검증 PS-2)."""
+    from types import SimpleNamespace
+    from law_indexer.auto_ingest import IngestPaths
+    from law_indexer.ingest_rules import merge_reports, merge_summaries
+    paths = IngestPaths(tmp_path / "root").ensure()
+    info = SimpleNamespace(attempt=1, workflow_run_id="run-1", activity_id="7")
+    monkeypatch.setattr(worker.activity, "info", lambda: info)
+    first = worker._merge_attempts(paths, "convert", [{"zip": "a.zip", "status": "failed"}], merge_reports)
+    assert first == [{"zip": "a.zip", "status": "failed"}]
+    info.attempt = 2
+    second = worker._merge_attempts(paths, "convert", [{"zip": "b.zip", "status": "converted"}], merge_reports)
+    assert [(r["zip"], r["status"]) for r in second] == [("a.zip", "failed"), ("b.zip", "converted")]
+    info.attempt = 1
+    s1 = worker._merge_attempts(paths, "consume", {"total": 2, "done": 1, "failed": 1, "zips": ["x"]}, merge_summaries)
+    info.attempt = 2
+    s2 = worker._merge_attempts(paths, "consume", {"total": 0, "done": 0, "failed": 0, "zips": []}, merge_summaries)
+    assert s1["failed"] == 1 and s2["failed"] == 1 and s2["total"] == 2 and s2["attempts"] == 2 and s2["zips"] == ["x"]
+    info.attempt, info.activity_id = 1, "8"                                   # 다음 sweep(다른 activity)은 섞이지 않는다
+    assert worker._merge_attempts(paths, "consume", {"total": 0, "failed": 0}, merge_summaries)["failed"] == 0
+
+    def no_activity():
+        raise RuntimeError("Not in activity context")
+
+    monkeypatch.setattr(worker.activity, "info", no_activity)
+    assert worker._merge_attempts(paths, "consume", {"failed": 3}, merge_summaries) == {"failed": 3}
+
+
+def test_merge_rules():
+    from law_indexer.ingest_rules import decide, merge_reports, merge_summaries
+    reports = merge_reports([[{"zip": "a.zip", "status": "failed"}],
+                             [{"zip": "a.zip", "status": "converted"}, {"zip": "b.zip", "status": "converted"}]])
+    assert [(r["zip"], r["status"]) for r in reports] == [("a.zip", "converted"), ("b.zip", "converted")]
+    summary = merge_summaries([{"total": 1, "failed": 1, "waiting": 1, "quality_guard": [{"zip": "a"}]},
+                               {"total": 1, "done": 1, "waiting": 0}])
+    assert summary["failed"] == 1 and summary["done"] == 1 and summary["total"] == 2 and summary["waiting"] == 0
+    assert summary["quality_guard"] == [{"zip": "a"}] and summary["attempts"] == 2
+    assert decide(reports, summary)[0] == "halt"
+    assert merge_summaries([]) == {}

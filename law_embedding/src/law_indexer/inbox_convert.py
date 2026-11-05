@@ -198,6 +198,18 @@ def _member_names(archive: zipfile.ZipFile) -> list:
     return out
 
 
+_JUNK_NAMES = {"thumbs.db", ".ds_store", "desktop.ini"}
+
+
+def _attachment_like(base: str) -> bool:
+    """소비자(zip_intake)가 첨부로 받는 파일인가 — 지원 확장자이고 OS·편집기 잡파일이 아닌 것."""
+    from .zip_intake import ZIP_ATTACHMENT_SUFFIXES
+    low = base.lower()
+    if low in _JUNK_NAMES or low.startswith(("~$", "._")):
+        return False
+    return PurePosixPath(low).suffix in ZIP_ATTACHMENT_SUFFIXES
+
+
 def plan_files(payload: dict, members: list) -> tuple:
     """같은 문서 폴더의 첨부 멤버 → (rename: 원본경로→새이름, drop: 버릴 경로).
 
@@ -288,7 +300,7 @@ def convert_zip(zip_path: Path, manifest: dict, out_zip: Path) -> dict:
     """배달 ZIP 1건 변환. 반환: 보고 dict(문서·rename·drop·오류). 같은 입력이면 같은 바이트를 쓴다."""
     docs_by_dir = {d["dir"]: d for d in manifest.get("docs") or []}
     report = {"zip": zip_path.name, "documents": 0, "renamed": 0, "dropped": 0, "kept": 0,
-              "errors": [], "payloads": []}
+              "dropped_unsupported": 0, "errors": [], "payloads": []}
     out_zip.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path) as src, zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as dst:
         members = _member_names(src)
@@ -321,11 +333,18 @@ def convert_zip(zip_path: Path, manifest: dict, out_zip: Path) -> dict:
             siblings = [n for _, n in members if n.startswith(folder + "/") and not n.endswith(".json")]
             rename, drop = plan_files(payload, siblings)
             dropped = set(drop)
+            declared = {a.get("name") for a in (payload.get("attachments") or []) if a.get("name")}
             for path in siblings:
                 if path in dropped:
                     report["dropped"] += 1
                     continue
                 new = rename.get(path)
+                base = path.rsplit("/", 1)[-1]
+                if new is None and base not in declared and not _attachment_like(base):
+                    # 잡파일(Thumbs.db·.DS_Store·임시파일)·지원 외 확장자(.txt 등) — 소비 쪽에서 ZIP 오류가 되어
+                    # ZIP 전체가 partial → HALT 로 멈추므로 여기서 뺀다. 원본 ZIP 은 done/ 에 그대로 남는다.
+                    report["dropped_unsupported"] += 1
+                    continue
                 target = (path.rsplit("/", 1)[0] + "/" + new) if new else path
                 dst.writestr(_entry(target, src.getinfo(by_name[path])), src.read(by_name[path]))
                 report["renamed" if new else "kept"] += 1

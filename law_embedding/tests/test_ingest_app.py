@@ -132,7 +132,7 @@ def test_same_bytes_again_is_duplicate_not_stored(env):
     assert again.status_code == 200
     body = again.json()
     assert body["duplicate"] and not body["stored"] and body["first_stored_as"] == first["stored_as"]
-    assert len(list(paths.inbox.glob("*.zip"))) == 1 and runner.triggers.count("ingest") == 1
+    assert len(list(paths.inbox.glob("*.zip"))) == 1 and runner.triggers.count("ingest") == 2   # duplicate 도 깨운다(앞선 trigger 실패 대비)
 
 
 def test_modified_resend_with_same_name_is_a_new_delivery(env):
@@ -177,7 +177,9 @@ def test_rejected_bytes_do_not_count_as_seen(env):
 def test_ops_upload_goes_to_ops_folder_untouched(env):
     """배포 번들·lib 전달 통로 — ZIP 검사·manifest·트리거 없이 ops/ 에 그대로 둔다."""
     client, paths, runner = env
-    r = client.post("/api/v1/law/ingest?kind=ops", files={"file": ("lib.tar.gz", b"\x1f\x8bnot-really", "application/gzip")})
+    assert client.post("/api/v1/law/ingest?kind=ops", files={"file": ("lib.tar.gz", b"x", "application/gzip")}).status_code == 403
+    r = client.post("/api/v1/law/ingest?kind=ops", files={"file": ("lib.tar.gz", b"\x1f\x8bnot-really", "application/gzip")},
+                    headers={"X-Law-Ops-Token": "secret"})
     assert r.status_code == 200 and r.json()["kind"] == "ops"
     stored = paths.ops / r.json()["stored_as"]
     assert stored.read_bytes() == b"\x1f\x8bnot-really" and stored.name.endswith("_lib.tar.gz")
@@ -253,3 +255,83 @@ def test_real_delivery_fixture_round_trips(env):
     mf = json.loads((FIX / "batch-20261021-001.manifest.json").read_text(encoding="utf-8"))
     r = _post(client, "batch-20261021-001.zip", data, mf)
     assert r.status_code == 200 and r.json()["manifest"] == {"documents": 1, "docs": 1}
+
+
+# ── 2026-11-05 전체 검증에서 나온 결함의 회귀 테스트 ──────────────────────────
+
+def test_manifest_only_fix_is_a_new_delivery(env):
+    """같은 ZIP 바이트라도 manifest 가 다르면 새 수신 — mst·dir 을 고친 재전송이 duplicate 로 막히면 영영 처리되지 않는다."""
+    client, paths, runner = env
+    data = _zip_bytes({"law/x/x.json": "{}"})
+    fixed_docs = [{"id": "001", "mst": "2", "dir": "law/x"}]
+    first = _post(client, "batch.zip", data, _manifest(data)).json()
+    fixed = _post(client, "batch.zip", data, _manifest(data, docs=fixed_docs)).json()
+    assert fixed["stored"] and not fixed["duplicate"] and fixed["stored_as"] != first["stored_as"]
+    assert len(list(paths.inbox.glob("*.zip"))) == 2
+    again = _post(client, "batch.zip", data, _manifest(data, docs=fixed_docs)).json()
+    assert again["duplicate"] and again["stored_as"] == fixed["stored_as"]
+
+
+def test_duplicate_response_carries_guide_fields(env):
+    """가이드가 '항상 있다'고 적은 filename·received_at·stored_as 는 duplicate 응답에도 있다."""
+    client, paths, runner = env
+    data = _zip_bytes({"law/x/x.json": "{}"})
+    _post(client, "batch.zip", data, _manifest(data))
+    body = _post(client, "batch.zip", data, _manifest(data)).json()
+    assert body["duplicate"] and body["filename"] == "batch.zip" and body["received_at"] and body["stored_as"]
+
+
+def test_bad_manifest_value_is_422_not_500(env):
+    """스트리밍이 끝난 뒤의 예외(bytes 비숫자 등)도 422 + rejected/ 보관 — 500 과 .part 고아가 남지 않는다."""
+    client, paths, runner = env
+    data = _zip_bytes({"law/x/x.json": "{}"})
+    r = _post(client, "batch.zip", data, _manifest(data, bytes="abc"))
+    assert r.status_code == 422 and "수신 검증 실패" in r.json()["error"]
+    assert len(list(paths.rejected.glob("*.zip"))) == 1 and not list(paths.inbox.glob(".*.part"))
+
+
+class _DeadRunner(FakeRunner):
+    worker_error = "RuntimeError: boom"
+
+    def healthy(self):
+        return False
+
+
+def test_health_is_503_when_worker_is_dead(tmp_path):
+    """워커 task 가 죽으면 /health 503 — 코드서빙이 파드를 다시 띄우게. 그 전엔 Schedule 만 돌고 아무도 집지 않았다."""
+    paths = IngestPaths(tmp_path / "root").ensure()
+    with TestClient(I.create_app(paths, _DeadRunner())) as client:
+        r = client.get("/health")
+        assert r.status_code == 503 and r.json()["error"] == "RuntimeError: boom"
+
+
+class _FlakyRunner(FakeRunner):
+    """halted()/trigger() 가 Temporal RPC 오류를 흉내 낸다."""
+
+    async def halted(self):
+        raise RuntimeError("temporal unreachable")
+
+    async def trigger(self, reason):
+        if reason == "startup":
+            return True
+        raise RuntimeError("temporal unreachable")
+
+
+def test_ingest_still_succeeds_when_scheduler_is_unreachable(tmp_path):
+    """저장이 끝난 수신은 Temporal 이 안 보여도 200 — 500 을 주면 상대가 재전송하고 그건 duplicate 로 끝나 영영 trigger 가 안 됐다."""
+    paths = IngestPaths(tmp_path / "root").ensure()
+    with TestClient(I.create_app(paths, _FlakyRunner())) as client:
+        data = _zip_bytes({"law/x/x.json": "{}"})
+        r = _post(client, "batch.zip", data, _manifest(data))
+        body = r.json()
+        assert r.status_code == 200 and body["stored"] and body["triggered"] is False
+        assert "temporal unreachable" in body["trigger_error"] and body["pipeline"]["halted"] is None
+        assert len(list(paths.inbox.glob("*.zip"))) == 1
+
+
+def test_env_file_must_exist(tmp_path, monkeypatch):
+    """LAW_ENV_FILE 경로가 틀리면 조용히 0키로 넘어가지 않고 여기서 멈춘다."""
+    monkeypatch.setenv("LAW_ROOT", str(tmp_path / "root"))
+    monkeypatch.setenv("LAW_ENV_FILE", str(tmp_path / "missing.env"))
+    with pytest.raises(RuntimeError, match="LAW_ENV_FILE"):
+        I._from_env()

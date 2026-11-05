@@ -1,6 +1,5 @@
 """러너(auto_ingest) — 판정·HALT·lease·실행 기록·재개. 변환·소비는 가짜 함수로 주입한다(외부 접속 없음)."""
 import json
-from pathlib import Path
 
 from law_indexer import auto_ingest as A
 
@@ -227,3 +226,57 @@ def test_attention_flags_missing_receipts(tmp_path):
     assert runner.status()["hours_since_last_receipt"] > 24
     record = runner.sweep("interval")
     assert record["verdict"] == "ok" and record["attention"][0].startswith("no_receipt_for_")
+
+
+# ── 2026-11-05 전체 검증 회귀 ───────────────────────────────────────────────
+
+def test_run_once_retries_and_merges_attempts(tmp_path):
+    """일시 장애는 다시 해 보고, 다시 할 때 앞선 시도의 보고(실패 ZIP)를 잃지 않는다."""
+    paths = _paths(tmp_path)
+    calls = {"convert": 0, "consume": 0}
+
+    def convert(inbox, outbox, *, done_dir, failed_dir):
+        calls["convert"] += 1
+        return [{"zip": "bad.zip", "status": "failed"}] if calls["convert"] == 1 else []
+
+    def consume(folder):
+        calls["consume"] += 1
+        if calls["consume"] == 1:
+            raise RuntimeError("NFS 순간 오류")
+        return _summary(done=1)
+
+    record = A.run_once(paths, convert, consume, retries=2, retry_wait_sec=0)
+    assert calls == {"convert": 2, "consume": 2} and record["attempts"] == 2
+    assert record["verdict"] == "halt" and record["reasons"] == ["convert_failed:bad.zip"]
+    assert record["consume"]["done"] == 1
+
+
+def test_run_once_gives_up_after_retries(tmp_path):
+    paths = _paths(tmp_path)
+
+    def convert(*a, **k):
+        raise RuntimeError("죽음")
+
+    record = A.run_once(paths, convert, lambda f: _summary(), retries=1, retry_wait_sec=0)
+    assert record["verdict"] == "halt" and record["attempts"] == 2 and record["reasons"][0].startswith("exception:")
+
+
+def test_requeue_from_done_forgets_consumed_state(tmp_path):
+    """VDB 재생성 뒤 같은 ZIP 을 다시 넣는 길 — done/ 에서 꺼내고 소비 흔적(state·converted/done)을 지운다."""
+    runner, paths, calls = _runner(tmp_path, ["ok"])
+    (paths.done / "b1.zip").write_bytes(b"zip-bytes")
+    (paths.done / "b1.manifest.json").write_bytes(b"{}")
+    cdone = paths.converted / "done"
+    cdone.mkdir(parents=True)
+    (cdone / "b1.zip").write_bytes(b"converted-bytes")
+    (cdone / "b1.manifest.json").write_bytes(b"{}")
+    state = paths.converted / "state"
+    state.mkdir()
+    sha = A._sha256(cdone / "b1.zip")
+    (state / f"{sha}.json").write_text("{}")
+    assert runner.requeue("b1.zip", "convert") == ["b1.zip", "b1.manifest.json"]
+    assert (paths.inbox / "b1.zip").exists() and not (state / f"{sha}.json").exists() and not (cdone / "b1.zip").exists()
+    (cdone / "b2.zip").write_bytes(b"c2")
+    (state / f"{A._sha256(cdone / 'b2.zip')}.json").write_text("{}")
+    assert runner.requeue("b2.zip", "consume") == ["b2.zip"]
+    assert (paths.converted / "b2.zip").exists() and not list(state.glob("*.json"))

@@ -180,3 +180,21 @@ def test_same_source_is_not_reconverted(tmp_path):
     [second] = C.convert_inbox(inbox, outbox)
     assert first["status"] == "converted" and second["status"] == "skipped"
     assert (outbox / "batch-20261021-001.zip").stat().st_mtime_ns == before
+
+
+def test_undeclared_junk_and_unsupported_files_are_dropped(tmp_path):
+    """잡파일·지원 외 확장자는 변환본에서 뺀다 — 소비 쪽에서 ZIP 오류가 되어 전체가 partial→HALT 로 멈추던 것
+    (2026-11-05 전체 검증 PS-4). 선언된 첨부와 지원 확장자의 미선언 파일은 그대로 둔다."""
+    src = tmp_path / "batch-20261021-001.zip"
+    shutil.copy(FIX / "batch-20261021-001.zip", src)
+    folder = "law/법률/검사의 보수에 관한 법률"
+    with zipfile.ZipFile(src, "a") as z:
+        z.writestr(f"{folder}/Thumbs.db", b"junk")
+        z.writestr(f"{folder}/notes.txt", b"memo")
+        z.writestr(f"{folder}/별표/~$임시.hwp", b"lock")
+    mf = json.loads((FIX / "batch-20261021-001.manifest.json").read_text(encoding="utf-8"))
+    rep = C.convert_zip(src, mf, tmp_path / "out.zip")
+    assert rep["errors"] == [] and rep["dropped_unsupported"] == 3 and rep["renamed"] == 2
+    with zipfile.ZipFile(tmp_path / "out.zip") as z:
+        names = sorted(n.rsplit("/", 1)[-1] for n in z.namelist() if not n.endswith(".json"))
+    assert names == ["별표1_검사의 봉급표.pdf", "별표2_검사의 봉급기준표.pdf"]

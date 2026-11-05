@@ -161,15 +161,19 @@ write_packages(result, Path("/mnt/handoff/packages"))        # source 별 <sourc
 
 ### 수신 규약 — 상대 측에 안내한 "재전송하면 갱신" 과 같다
 
-- 같은 ZIP 을 다시 보내면 200 `duplicate` — 저장·적재하지 않습니다(바이트 SHA-256 기준).
-- 내용이나 파일명을 고쳐 다시 보내면 새 수신입니다. 수신 시각 접두가 붙어 **도착 순서 = 처리 순서**이고, 그 법령은 갱신됩니다 — 같은 버전(version_uid)이면 제자리 덮어쓰기 + 이번 결과에 없는 청크 정리, 새 버전이면 교체.
+- 같은 ZIP 을 **같은 manifest 로** 다시 보내면 200 `duplicate` — 저장·적재하지 않습니다(ZIP 바이트 SHA-256 + manifest 바이트 기준). manifest 만 고쳐(mst·dir 정정) 다시 보내면 새 수신입니다. duplicate 라도 멈춤이 아니면 스케줄을 한 번 깨웁니다(앞선 수신의 trigger 가 실패했을 때를 위해).
+- 내용을 고쳐 다시 보내면 새 수신입니다(파일명만 바꾼 것은 바이트가 같아 duplicate). 수신 시각 접두가 붙어 **도착 순서 = 처리 순서**이고, 그 법령은 갱신됩니다 — 같은 버전(version_uid)이면 제자리 덮어쓰기 + 이번 결과에 없는 청크 정리, 새 버전이면 교체.
 - **옛 버전은 건너뜁니다.** 저장된 것보다 (시행일, MST — 행정규칙은 개정일, 일련번호) 가 작으면 적재하지 않고 `version_skipped` 로 기록합니다(실패가 아닙니다). 최신판을 일부러 되돌릴 때만 `consume-zip --allow-older-version`(수동).
 - manifest(`docs[].mst` 포함)는 **같은 요청의 `manifest` 필드**로 보냅니다. 없으면 422 — law 의 MST 가 manifest 에만 있어 변환할 수 없습니다. 받은 ZIP 은 `rejected/` 에 남깁니다. manifest 의 `sha256`·`bytes` 가 받은 바이트와 다르면 역시 422(전송 손상).
 - 한 ZIP 20MB 이하(게이트웨이 본문 한도 실측 ~25MB).
 
 ### 멈춤(HALT)
 
-변환 실패 ZIP · 적재 실패(`failed`) · 부분 완료(`partial`) · 품질 가드 · 잠금 충돌 · manifest 없이 유예 초과가 하나라도 있으면 워크플로가 실패하고 Schedule 이 일시정지됩니다(로컬 모드에서는 `<LAW_ROOT>/HALT.json`). 수신은 계속 받아 쌓습니다. 순서 규칙("나중 ZIP 이 최종") 때문에 실패 ZIP 을 두고 뒤를 계속 적재하면 재처리 때 옛 내용이 최신을 덮으므로 멈추는 쪽이 안전합니다. 사람이 원인을 고친 뒤 `POST /api/v1/pipeline/resume`(헤더 `X-Law-Ops-Token`) 로 풉니다 — unpause + 즉시 한 번. 실패분 재투입은 `POST /api/v1/pipeline/requeue?zip=<이름>&stage=convert|consume`(파드가 옮깁니다 — 파드 소유 폴더를 손으로 만질 필요 없음).
+변환 실패 ZIP · 적재 실패(`failed`) · 부분 완료(`partial`) · 품질 가드 · 잠금 충돌 · manifest 없이 유예 초과가 하나라도 있으면 워크플로가 실패하고 Schedule 이 일시정지됩니다(로컬 모드에서는 `<LAW_ROOT>/HALT.json`). 수신은 계속 받아 쌓습니다. 순서 규칙("나중 ZIP 이 최종") 때문에 실패 ZIP 을 두고 뒤를 계속 적재하면 재처리 때 옛 내용이 최신을 덮으므로 멈추는 쪽이 안전합니다. 사람이 원인을 고친 뒤 `POST /api/v1/pipeline/resume`(헤더 `X-Law-Ops-Token`) 로 풉니다 — unpause + 즉시 한 번. 재투입은 `POST /api/v1/pipeline/requeue?zip=<이름>&stage=convert|consume` — `failed/` 뿐 아니라 **`done/` 에서도** 꺼냅니다(VDB 를 다시 만든 뒤 같은 ZIP 을 다시 적재할 때. 소비 흔적 `converted/state` 도 같이 지웁니다). 파드가 옮기므로 파드 소유 폴더를 손으로 만질 필요 없습니다.
+
+- 멈춤 사유가 **아닌** 것: 잡파일(Thumbs.db·.DS_Store·`~$` 임시파일)과 지원 외 확장자(.txt 등)는 변환기가 변환본에서 빼고 `dropped_unsupported` 로 셉니다. 문서가 선언하지 않은 지원 확장자 첨부(`[별표 1] ….hwp` 인데 JSON 에 없음)는 고아로 남아 `partial` 이 됩니다 — 수집기 쪽 매칭 문제라 사람이 봐야 합니다.
+- 일시 장애(법 목록 API·NFS·Weaviate 재접속)는 activity 재시도(1분→2분→4분…, 변환 3회·소비 5회)로 넘깁니다. 재시도 사이에 `failed/` 로 옮겨진 ZIP 의 보고는 `runs/attempts/` 에 모아 합쳐 판정합니다(앞선 시도의 실패가 사라지지 않습니다). 로컬 모드는 `LAW_RUN_RETRIES`(2)·`LAW_RUN_RETRY_WAIT_SEC`(60).
+- 한 실행의 상한 `LAW_RUN_TIMEOUT_HOURS`(12): 워커가 죽어 Running 에 고착된 실행이 뒤 실행을 영원히 막지 않게 — 타임아웃도 실패라 일시정지(HALT)로 드러납니다.
 
 - 변환 실패분: `<LAW_ROOT>/failed/<이름>.zip`·`.manifest.json`·`.convert-report.json`. 고친 뒤 원본 쌍을 `<LAW_ROOT>/` 로 되돌립니다.
 - 적재 실패·부분 완료: 위 「ZIP 수신」의 재처리 절차 그대로(`converted/` 가 consume-zip 폴더).
@@ -183,18 +187,19 @@ write_packages(result, Path("/mnt/handoff/packages"))        # source 별 <sourc
 
 ### 확인 창구 (GenOS 에 알림 기능이 없어 사람이 보러 간다)
 
-- `GET /api/v1/pipeline/status` — `mode`·`state`(idle/running/halted)·`halt`(일시정지 사유)·`attention`·`schedule`(cron·다음 실행·실행 수)·`last_run`(결과 또는 멈춤 사유)·`last_received_at`·수신 대기·실패 수·디스크
+- `GET /api/v1/pipeline/status` — `mode`·`state`(idle/running/halted, Temporal 이 잠깐 안 보이면 `unknown` + `temporal.error`)·`halt`(일시정지 사유)·`attention`(`worker_not_running:<사유>` 포함)·`schedule`(다음 실행 `next_run_at`·실행 수. `cron` 은 서버가 calendar 로 정규화한 문자열)·`last_run`(결과 또는 멈춤 사유 — activity 실패면 안쪽 원인까지)·`last_received_at`·수신 대기·실패 수·디스크
+- `GET /health` — 200. Temporal 워커 task 가 죽었으면 **503**(코드서빙이 파드를 다시 띄우게). 그 전에는 Schedule 만 돌고 아무도 집지 않아 조용히 멈췄습니다.
 - `GET /api/v1/pipeline/runs?limit=20` — 최근 워크플로 실행(Temporal visibility, 리텐션 7일). 상세는 `/temporal` UI 의 `LawInboxWorkflow`
-- 코드서빙 800 로그의 `[law-ingest] …` 한 줄 기록, 코드스페이스에서 `<LAW_ROOT>` 직접 열람
+- 코드서빙 800 로그의 `[law-ingest] …` 한 줄 기록(기동 때 `versions {python, temporalio, weaviate, google.protobuf, grpc …}` 한 줄 — 베이스 이미지와 번들 lib 중 어느 것이 로딩됐는지), 코드스페이스에서 `<LAW_ROOT>` 직접 열람
 - 상대 측이 받는 응답의 `pipeline.halted`
 
 ### 배포
 
 1. `scripts/make_codeserving_bundle.sh ../../_bundle_cs800` → `main.py` + `src/law_indexer` + `lib/`(cp312 wheel 해제본, pip 미사용)
-2. zip 으로 묶어 `POST …/800/api/v1/law/ingest?kind=ops` 로 올리고(20MB 초과면 split) 코드스페이스에서 풀어 Gitea `llmops/800` 내용을 통째로 교체 → push
+2. zip 으로 묶어 `POST …/800/api/v1/law/ingest?kind=ops`(헤더 `X-Law-Ops-Token` 필요 — 상대 측 게이트웨이 키만으로는 못 올립니다) 로 올리고(20MB 초과면 split) 코드스페이스에서 풀어 Gitea `llmops/800` 내용을 통째로 교체 → push
 3. 관리자 UI: 리비전 추가(새 커밋 해시) → 환경설정 탭 → 복제본 **1**·HA 끔 → 배포 → 가중치 100 → **구 리비전 수동 중지**(안 멈추면 두 파드가 같은 폴더를 봅니다 — `lease.json` 이 2차로 막지만 수칙이 1차)
 
-환경변수: UI 에는 `LAW_ROOT`·`LAW_OPS_TOKEN`·`LAW_ENV_FILE`·`LAW_SCHEDULER=temporal`·`TEMPORAL_ADDRESS`·`TEMPORAL_NAMESPACE` 를 넣고 나머지는 `LAW_ENV_FILE` 이 가리키는 NFS 의 `.env`(운영 .env 사본)에서 읽는 것을 권합니다(UI 값이 우선). 전체 목록: `LAW_ROOT`(NFS, 예 `/nfs-root/DEV/volume/326/law-inbox`) · `LAW_SCHEDULER`(temporal) · `LAW_SCHEDULE_CRON`(`0 * * * *`, Asia/Seoul) · `INDEX_TASK_QUEUE`(law-embedding) · `TEMPORAL_ADDRESS`(예 `temporal-frontend.temporal.svc.cluster.local:7233`, 또는 코드서빙이 주입하는 `TEMPORAL_HOST`/`TEMPORAL_PORT`) · `TEMPORAL_NAMESPACE`(llmops) · `LAW_SWEEP_INTERVAL_SEC`(600, 로컬 모드만) · `LAW_OPS_TOKEN` · `LAW_HALT_ON_PARTIAL`(true) · `LAW_RETENTION_DAYS`(30) · `LAW_MANIFEST_GRACE_SEC`(3600) · `LAW_EXPECT_INTERVAL_HOURS`(0) + 운영 `.env` 의 `WEAVIATE_*`·`LAW_COLLECTION`·`EMBEDDING_*`·`DOC_PARSER_*`(`DOC_PARSER_SHARED_HOST_DIR` = `DOC_PARSER_SHARED_CONTAINER_DIR` = `<LAW_ROOT>/shared` — 800 과 355 가 같은 `/nfs-root` 를 본다) · `LAW_SCOPE_ENABLED`.
+환경변수: UI 에는 `LAW_ROOT`·`LAW_OPS_TOKEN`·`LAW_ENV_FILE`·`LAW_SCHEDULER=temporal`·`TEMPORAL_ADDRESS`·`TEMPORAL_NAMESPACE` 를 넣고 나머지는 `LAW_ENV_FILE` 이 가리키는 NFS 의 `.env`(운영 .env 사본)에서 읽는 것을 권합니다(UI 값이 우선). 전체 목록: `LAW_ROOT`(NFS, 예 `/nfs-root/DEV/volume/326/law-inbox`) · `LAW_SCHEDULER`(temporal) · `LAW_SCHEDULE_CRON`(`0 * * * *`, Asia/Seoul) · `INDEX_TASK_QUEUE`(law-embedding) · `TEMPORAL_ADDRESS`(예 `temporal-frontend.temporal.svc.cluster.local:7233`, 또는 코드서빙이 주입하는 `TEMPORAL_HOST`/`TEMPORAL_PORT`) · `TEMPORAL_NAMESPACE`(llmops) · `LAW_SWEEP_INTERVAL_SEC`(600, 로컬 모드만) · `LAW_OPS_TOKEN` · `LAW_HALT_ON_PARTIAL`(true) · `LAW_RETENTION_DAYS`(30) · `LAW_MANIFEST_GRACE_SEC`(3600) · `LAW_EXPECT_INTERVAL_HOURS`(0) · `LAW_RUN_TIMEOUT_HOURS`(12) · `LAW_TEMPORAL_CREATE_NAMESPACE`(true) · `LAW_RUN_RETRIES`/`LAW_RUN_RETRY_WAIT_SEC`(2/60, 로컬 모드만) + 운영 `.env` 의 `WEAVIATE_*`·`LAW_COLLECTION`·`EMBEDDING_*`·`DOC_PARSER_*`(`DOC_PARSER_SHARED_HOST_DIR` = `DOC_PARSER_SHARED_CONTAINER_DIR` = `<LAW_ROOT>/shared` — 800 과 355 가 같은 `/nfs-root` 를 본다) · `LAW_SCOPE_ENABLED`.
 
 수동·검증: `python -m law_indexer auto-ingest --root <LAW_ROOT> --once` (멈춤 사유가 있으면 exit 2). 라이브 폴더에 `consume-zip` 을 따로 돌리지 않습니다(러너와 겹침).
 
@@ -211,12 +216,30 @@ write_packages(result, Path("/mnt/handoff/packages"))        # source 별 <sourc
 | 전처리기 코드서빙 | genos 전처리기 패키지 | `DOC_PARSER_BASE_URL`, `DOC_PARSER_API_KEY` |
 | 코드스페이스 | NFS 볼륨이 같이 생김 → 그 안에 `law-inbox/` 폴더 | `LAW_ROOT`(파드 쪽 경로 `/nfs-root/DEV/volume/<id>/law-inbox`) |
 | Temporal | 코드스페이스에서 `python3 -c "import socket;socket.create_connection(('temporal-frontend.temporal.svc.cluster.local',7233),3);print('OK')"` | 있으면 `LAW_SCHEDULER=temporal`, 없으면 `local` |
+| Temporal 네임스페이스 | 파드가 첫 기동 때 **없으면 만듭니다**(`LAW_TEMPORAL_CREATE_NAMESPACE=true` 기본, 보존 30일). Temporal UI 로는 못 만들고, 권한 문제로 실패하면 기동 로그에 `네임스페이스 … 생성 실패` 가 찍히니 그때는 아래 수동 생성 | `TEMPORAL_NAMESPACE` |
 
-**1. 코드 준비(개발 PC)** — `scripts/make_codeserving_bundle.sh ../../_bundle_cs800` → `main.py + src/law_indexer + lib/`. 그 사이트 `template-code-serving` 의 파이썬이 3.12 가 아니면 스크립트의 `--python-version`·`--abi` 를 맞춰 다시 받습니다. zip 으로 묶고 20MB 를 넘으면 `split -b 19m`.
+수동 생성(번들 푼 폴더에서, 베이스 파이썬 3.12):
+```bash
+cd /workspace/cs800 && PYTHONPATH=lib python3 - <<'PY'
+import asyncio
+from temporalio.client import Client
+from temporalio.api.workflowservice.v1 import RegisterNamespaceRequest
+from google.protobuf.duration_pb2 import Duration
+async def main():
+    c = await Client.connect("temporal-frontend.temporal.svc.cluster.local:7233")
+    await c.workflow_service.register_namespace(RegisterNamespaceRequest(
+        namespace="llmops", workflow_execution_retention_period=Duration(seconds=30*86400)))
+    print("생성됨 — 반영까지 10초쯤")
+asyncio.run(main())
+PY
+```
+같은 클러스터에 다른 법령 스택(예: `law-data` 네임스페이스)이 있으면 그 네임스페이스는 쓰지 않습니다 — 큐 이름 `law-embedding` 이 겹쳐 서로의 package 를 집습니다.
+
+**1. 코드 준비(개발 PC)** — `scripts/make_codeserving_bundle.sh ../../_bundle_cs800` → `main.py + src/law_indexer + lib/`. 그 사이트 `template-code-serving` 의 파이썬이 3.12 가 아니면 스크립트의 `--python-version`·`--abi` 를 맞춰 다시 받습니다. zip 으로 묶고 20MB 를 넘으면 `split -b 19m`. **폐쇄망 반입이면 이 번들 zip 을 소스와 같이 가져갑니다** — `lib/` 의 wheel(weaviate-client 와 의존성)은 PyPI 에서 받는 것이라 현장에서는 만들 수 없습니다. 노드가 x86_64·파이썬 3.12 가 아니면 `lib/` 전체가 무용하니 반입 전에 확인(기동 로그 `versions` 줄의 `machine`·`python`).
 
 **2. 수신 코드서빙** — 관리자 UI 에서 코드서빙 신규(내부 Gitea 저장소가 같이 생김) → 코드스페이스 VS Code 탐색기에 번들 zip 을 끌어다 놓고 풀어 그 저장소 내용으로 통째 교체 → `git push`(Password 프롬프트에는 GenOS 토큰) → 리비전 추가(그 커밋, 이미지 `template-code-serving`, START/BUILD 비움, 복제본 1, HA 끔).
 
-**3. 설정** — 코드스페이스에서 `law-inbox/.env` 작성(`.env.example` 을 그 사이트 값으로: `WEAVIATE_*`·`LAW_COLLECTION`·`EMBEDDING_*`·`DOC_PARSER_*`, `DOC_PARSER_SHARED_HOST_DIR`=`DOC_PARSER_SHARED_CONTAINER_DIR`=`<LAW_ROOT>/shared`), `mkdir -p law-inbox/shared && chmod 777 law-inbox/shared`. UI 환경변수:
+**3. 설정** — 코드스페이스에서 `law-inbox/.env` 작성(`.env.example` 을 그 사이트 값으로: `WEAVIATE_*`·`LAW_COLLECTION`·**`EMBEDDING_BACKEND=remote`**(기본 `local` 을 두면 sentence-transformers 가 없어 기동 실패)·`EMBEDDING_API_URL/KEY`·`DOC_PARSER_*`, `DOC_PARSER_SHARED_HOST_DIR`=`DOC_PARSER_SHARED_CONTAINER_DIR`=`<LAW_ROOT>/shared`), `mkdir -p law-inbox/shared && chmod 777 law-inbox/shared`. `LAW_ENV_FILE` 경로가 틀리면 기동 로그에 `LAW_ENV_FILE 이 가리키는 파일이 없습니다` 로 바로 멈춥니다. UI 환경변수:
 
 ```
 LAW_ROOT=/nfs-root/DEV/volume/<id>/law-inbox
@@ -229,7 +252,7 @@ TEMPORAL_NAMESPACE=llmops
 
 배포 → 승인 → 가중치 100 → 이전 리비전 중지 → 상대 측에 줄 AuthKey 발급.
 
-**4. 배포하면 자동으로 일어나는 것** — 파드가 뜨면 `.env` 를 읽고 → Temporal 에 붙어 → Schedule `law-inbox` 가 없으면 만들고(`LAW_SCHEDULE_CRON`, Asia/Seoul) → 이 파드가 워커로 큐 `law-embedding` 을 폴링 → 시작 직후 한 번 돌고 → `/health` 200. 확인: `GET …/api/v1/pipeline/status` 에 `mode: temporal` 과 `schedule.cron`, `/temporal` UI 에 `LawInboxWorkflow`.
+**4. 배포하면 자동으로 일어나는 것** — 파드가 뜨면 `.env` 를 읽고 → Temporal 에 붙어(네임스페이스가 없으면 만들고) → Schedule `law-inbox` 가 없으면 만들고 있으면 현재 설정(LAW_ROOT·큐·cron)으로 **갱신**하고(일시정지·메모는 보존) → 이 파드가 워커로 큐 `law-embedding` 을 폴링 → 시작 직후 한 번 돌고 → `/health` 200. 확인: `GET …/api/v1/pipeline/status` 에 `mode: temporal`, `schedule.next_run_at` 에 다음 정각, `temporal.worker_alive: true`; `/temporal` UI 에 `LawInboxWorkflow`. (`schedule.cron` 은 서버가 calendar 로 정규화한 문자열이라 원래 cron 과 모양이 다릅니다.)
 
 **5. 배치가 도는 세 가지 길** — ① 상대 측 `POST /api/v1/law/ingest`(ZIP+manifest) → 저장 → Schedule trigger → 즉시 1회 ② cron ③ `POST /api/v1/pipeline/run`. 한 번 = 변환 activity → consume-zip activity(일시장애면 15분 뒤 재시도, 최대 5회) → 판정. 멈춤 사유 → 워크플로 Failed → Schedule 일시정지 → `status: halted` → 원인 조치 → `POST /api/v1/pipeline/resume`. 실패 ZIP 재투입 `POST /api/v1/pipeline/requeue?zip=…&stage=convert|consume`.
 

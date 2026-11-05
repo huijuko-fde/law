@@ -133,12 +133,34 @@ def consume_package_activity(req: PackageRequest) -> dict:
     return result
 
 
+def _merge_attempts(paths, kind: str, output, combine):
+    """activity 재시도가 앞선 시도의 보고를 잃지 않게 — 시도마다 결과를 runs/attempts/ 에 쌓고 합쳐 돌려준다.
+
+    1차 시도가 ZIP 일부를 failed/ 로 옮긴 뒤 예외로 죽으면 2차 시도는 빈 폴더만 보고 ok 를 내렸다(실패 ZIP 은
+    failed/ 에 조용히 남고 Schedule 은 계속 돈다). 파일은 (워크플로 run, activity) 단위라 sweep 이 여러 번
+    돌아도 섞이지 않는다. activity 밖(직접 호출)에서는 그대로 돌려준다."""
+    try:
+        info = activity.info()
+    except RuntimeError:
+        return output
+    from .auto_ingest import read_json, write_json
+    path = paths.runs / "attempts" / f"{info.workflow_run_id}.{info.activity_id}.{kind}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    prev = read_json(path)
+    attempts = (prev if isinstance(prev, list) else []) + [output]
+    write_json(path, attempts)
+    if len(attempts) > 1:
+        log.warning("[law-ingest] %s activity attempt %d — 앞선 %d회 보고를 합쳐 판정", kind, info.attempt, len(attempts) - 1)
+        return combine(attempts)
+    return output
+
+
 @activity.defn(name=CONVERT_INBOX_ACTIVITY)
 def convert_inbox_activity(req: LawInboxRequest) -> list:
     """수신 폴더의 배달 ZIP(+manifest)을 적재기 ZIP 으로 변환(LAW-28). Weaviate·임베더 불필요."""
     from .auto_ingest import IngestPaths, manifest_overdue
     from .inbox_convert import convert_inbox
-    from .ingest_rules import trim_report
+    from .ingest_rules import merge_reports, trim_report
     paths = IngestPaths(Path(req.root)).ensure()
     with heartbeating():
         reports = convert_inbox(paths.inbox, paths.converted, done_dir=paths.done, failed_dir=paths.failed)
@@ -147,13 +169,14 @@ def convert_inbox_activity(req: LawInboxRequest) -> list:
         reports.append({"zip": name, "status": "failed",
                         "errors": [{"error": f"manifest 없이 {req.manifest_grace_sec}초 넘게 대기 — 치우거나 manifest 를 놓고 resume"}]})
     log.info("convert_inbox(%s) %s", req.root, [(r.get("zip"), r.get("status")) for r in reports])
-    return [trim_report(r) for r in reports]
+    return _merge_attempts(paths, "convert", [trim_report(r) for r in reports], merge_reports)
 
 
 @activity.defn(name=CONSUME_ZIP_ACTIVITY)
 def consume_zip_activity(req: LawInboxRequest) -> dict:
     """변환된 ZIP 폴더(LAW_ROOT/converted)를 consume-zip 으로 한 번 훑는다(LAW-28). 적재 범위는 매번 새로 읽는다."""
     from .auto_ingest import IngestPaths, retire
+    from .ingest_rules import merge_summaries
     from .law_scope import load_law_scope
     from .zip_consume import consume_zip_folder
     settings = _get_settings()
@@ -167,7 +190,7 @@ def consume_zip_activity(req: LawInboxRequest) -> dict:
     log.info("consume_zip(%s) done=%s partial=%s failed=%s waiting=%s version_skipped=%s",
              req.root, summary.get("done"), summary.get("partial"), summary.get("failed"),
              summary.get("waiting"), summary.get("version_skipped"))
-    return summary
+    return _merge_attempts(paths, "consume", summary, merge_summaries)
 
 
 WORKFLOWS = [InitialIndexWorkflow, ConsumePackageWorkflow, LawInboxWorkflow]

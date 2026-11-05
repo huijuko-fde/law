@@ -724,3 +724,45 @@ def test_other_markers_untouched(tmp_path):
     art = [o for o in _flat(store.upserted) if o.provision_id == "admrul:A9#JO0093"][0]
     assert "[별표1]" in art.content and "[서식]" in art.content
     assert "[그림]" not in art.content
+
+
+# ── 행정규칙 버전 가드 (2026-11-05 전체 검증 PS-1) ──────────────────────────
+
+def _admrul_payload(seq="2100000285778", revision_date="2026-10-02"):
+    return {"law_id": "67925", "adm_uid": "admrul:67925", "mst": seq, "law_name": "수용자 교육교화 운영지침",
+            "law_type": "예규", "revision_date": revision_date,
+            "body": {"articles": [{"article_no": "제1조", "article_title": "목적", "content": "목적 조문",
+                                   "provision_id": "admrul:67925#JO0001"}]}}
+
+
+def test_admrul_meta_gets_synthesized_version_uid_for_version_guard():
+    """행정규칙 payload 에는 version_uid 가 없다 — 저장본(mapper 합성 adm_uid:개정일)과 같은 키로 비교해야 한다.
+    비어 있으면 (0, 일련번호)로 평가돼 두 번째 배달부터 전부 '옛 버전'으로 건너뛰었다."""
+    meta = package._law_meta(_admrul_payload(), "67925")
+    assert meta["version_uid"] == "admrul:67925:2026-10-02"
+    store = FakeStore()
+    store.versions["67925"] = [{"version_uid": "admrul:67925:2026-10-02", "mst": "2100000285778"}]
+    assert package._older_than_stored(store, "67925", meta, "C") is None                       # 같은 버전 — 제자리 갱신
+    newer = package._law_meta(_admrul_payload("2100000999999", "2027-01-01"), "67925")
+    assert package._older_than_stored(store, "67925", newer, "C") is None                      # 개정본
+    older = package._law_meta(_admrul_payload("1", "2025-01-01"), "67925")
+    assert package._older_than_stored(store, "67925", older, "C")["stored"] == ["admrul:67925:2026-10-02"]
+
+
+def test_admrul_resend_and_revision_are_loaded(tmp_path):
+    """같은 버전 재전송은 제자리 갱신 + 고아 정리, 개정본은 교체, 옛 개정본만 건너뛴다 — 행정규칙 package 로."""
+    def consume(store, payload, **kw):
+        pkg = _write(tmp_path, _header(source="admrul"),
+                     {"record_type": "document", "op": "upsert", "law_id": payload["law_id"], "payload": payload})
+        return consume_package(store, FakeEmbedder(), Settings.from_env(), pkg, **kw)
+
+    store = FakeStore()
+    store.versions["67925"] = [{"version_uid": "admrul:67925:2026-10-02", "mst": "2100000285778"}]
+    totals = consume(store, _admrul_payload())
+    assert "version_skipped" not in totals and len(_flat(store.upserted)) == 1
+    assert store.orphan_json and store.orphan_json[0][1] == "admrul:67925:2026-10-02"
+    totals = consume(store, _admrul_payload("2100000999999", "2027-01-01"))
+    assert "version_skipped" not in totals
+    assert [o.version_uid for o in store.upserted[-1]] == ["admrul:67925:2027-01-01"]
+    totals = consume(store, _admrul_payload("1", "2025-01-01"))
+    assert totals["version_skipped"] == 1

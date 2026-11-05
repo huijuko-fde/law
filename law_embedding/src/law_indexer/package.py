@@ -32,8 +32,8 @@ from .config import Settings
 from .embedder import LocalEmbedder
 from .law_scope import LawScope
 from .mapper import (
-    _compact_name, build_search_text, iso_date, map_admrul_data, map_attachment_data,
-    map_law_data, stable_id,
+    _compact_name, _synthesize_admrul_version_uid, build_search_text, iso_date, map_admrul_data,
+    map_attachment_data, map_law_data, stable_id,
 )
 from .models import LegalProvision
 from .preprocess import (
@@ -487,6 +487,11 @@ def _law_meta(payload: Optional[dict], fallback_law_id: str) -> dict:
     meta["source_url"] = source.get("source_url")
     meta["adm_uid"] = payload.get("adm_uid")
     meta["git_path"] = payload.get("git_path")
+    if not meta.get("version_uid") and meta["adm_uid"]:
+        # 행정규칙 payload 에는 version_uid 가 없다 — mapper 가 저장 때 합성하는 값(adm_uid:개정일)과 같은 키로
+        # 채워야 버전 가드(_older_than_stored)와 고아 정리가 저장본과 비교된다. 비워 두면 (0, 일련번호)로
+        # 평가돼 저장본(개정일, 일련번호)보다 항상 '옛 버전'이 되어 두 번째 배달부터 전부 건너뛰었다.
+        meta["version_uid"] = _synthesize_admrul_version_uid(payload)
     return meta
 
 

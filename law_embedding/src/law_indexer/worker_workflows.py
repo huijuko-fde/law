@@ -86,6 +86,11 @@ class LawInboxRequest:
 _HB_MIN = int(os.getenv("INDEX_HEARTBEAT_TIMEOUT_MIN", "5"))
 _HB = {"heartbeat_timeout": timedelta(minutes=_HB_MIN)} if _HB_MIN > 0 else {}
 
+# 수신 처리 activity 의 재시도 간격 — 일시 장애(admin-api 롤링 재시작·NFS 순간 오류·Weaviate 재접속)를
+# 넘길 만큼 벌린다. SDK 기본(1초·2초 백오프)이면 3번이 3.5초 안에 끝나 사실상 재시도 없이 HALT 가 됐다.
+_INBOX_RETRY = dict(initial_interval=timedelta(minutes=1), backoff_coefficient=2.0,
+                    maximum_interval=timedelta(minutes=10))
+
 
 @workflow.defn
 class InitialIndexWorkflow:
@@ -130,7 +135,7 @@ class LawInboxWorkflow:
             CONVERT_INBOX_ACTIVITY, req,
             start_to_close_timeout=timedelta(hours=1),
             **_HB,
-            retry_policy=RetryPolicy(maximum_attempts=2),
+            retry_policy=RetryPolicy(maximum_attempts=3, **_INBOX_RETRY),
         )
         summary = await self._consume(req)
         sweeps = 1
@@ -151,5 +156,5 @@ class LawInboxWorkflow:
             CONSUME_ZIP_ACTIVITY, req,
             start_to_close_timeout=timedelta(hours=6),
             **_HB,
-            retry_policy=RetryPolicy(maximum_attempts=3),
+            retry_policy=RetryPolicy(maximum_attempts=5, **_INBOX_RETRY),
         )

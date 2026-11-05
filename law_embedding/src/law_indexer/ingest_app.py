@@ -1,9 +1,9 @@
 """법령 ZIP 수신 + 자동 적재 — 코드서빙 800 의 앱 (LAW-39 수신기 + LAW-28 스케줄러).
 
 엔드포인트
-  GET  /health                     항상 200 — startupProbe 전용, 파이프라인 상태와 무관
+  GET  /health                     200. Temporal 워커 task 가 죽었으면 503(코드서빙이 파드를 다시 띄우게)
   GET  /api/v1/ping
-  POST /api/v1/law/ingest          multipart: file(ZIP) + manifest(JSON). 같은 요청에 둘 다
+  POST /api/v1/law/ingest          multipart: file(ZIP) + manifest(JSON). 같은 요청에 둘 다. ?kind=ops 는 X-Law-Ops-Token
   GET  /api/v1/files               수신 폴더 목록(확인용)
   GET  /api/v1/pipeline/status     스케줄 상태·마지막 실행·멈춤 여부
   GET  /api/v1/pipeline/runs       실행 기록 최근 N건
@@ -20,7 +20,8 @@
   local     Temporal 없는 환경(개발·검증) — 프로세스 안 러너(auto_ingest.Runner)가 이벤트+주기로 돈다.
 
 수신 규약 — 상대 측에 안내한 "재전송하면 갱신" 과 맞춘다.
-  · 같은 바이트(SHA-256)를 다시 보내면 200 duplicate — 저장도 적재도 하지 않는다.
+  · 같은 바이트(SHA-256)를 **같은 manifest 로** 다시 보내면 200 duplicate — 저장도 적재도 하지 않는다(멈춤이
+    아니면 스케줄은 한 번 깨운다). manifest 만 고쳐(mst·dir 정정) 다시 보내면 새 수신이다.
   · 같은 이름이라도 내용이 다르면 새 수신으로 받는다. 수신 시각 접두 `YYYYMMDD-HHMMSS-ffffff_` 를 ZIP 과
     manifest 에 같이 붙이므로 처리 순서 = 도착 순서. 옛 버전이 최신을 덮는 것은 적재기의 버전 가드가
     막는다(package._older_than_stored).
@@ -36,6 +37,7 @@ env: LAW_ROOT(필수)  LAW_ENV_FILE(NFS 의 .env — 나머지 키를 여기서 
 """
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -58,6 +60,29 @@ log = logging.getLogger("law_embedding.ingest")
 
 ATTACH = (".hwp", ".hwpx", ".pdf", ".doc", ".docx", ".png", ".jpg", ".jpeg", ".gif")
 _UNSAFE = re.compile(r"[\\/\x00-\x1f]")        # 경로 구분자·제어문자만 막는다(한글 이름은 그대로)
+
+
+def _setup_logging() -> None:
+    """uvicorn 은 root 에 핸들러를 달지 않아 이 앱의 INFO(`[law-ingest] accepted …`, sweep 결과)가 버려졌다 —
+    폐쇄망에서 'ZIP 이 들어갔나' 를 로그로 볼 수 없었다. root 에 핸들러가 없을 때만 단다(단독 워커의
+    basicConfig 와 겹치지 않는다). uvicorn 자체 로거는 propagate=False 라 영향 없다."""
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    logging.getLogger("law_embedding").setLevel(logging.INFO)
+
+
+def _versions() -> dict:
+    """기동 로그 한 줄 — 베이스 이미지의 파이썬·temporalio·protobuf 와 번들 lib/ 가 섞이는 구조라 실제로 어느
+    것이 로딩됐는지 현장에서 바로 보게 한다(protobuf 런타임이 lib 의 gencode 보다 낮으면 weaviate 가 안 뜬다)."""
+    import platform
+    out = {"python": platform.python_version(), "machine": platform.machine()}
+    for mod in ("temporalio", "weaviate", "google.protobuf", "grpc", "fastapi"):
+        try:
+            m = __import__(mod, fromlist=["__version__"])
+            out[mod] = f"{getattr(m, '__version__', '?')} @ {Path(getattr(m, '__file__', '?')).parent}"
+        except Exception as exc:                        # 없는 모듈도 한 줄로 — 기동 실패 원인 추적용
+            out[mod] = f"import 실패: {type(exc).__name__}: {exc}"
+    return out
 
 
 def _now() -> str:
@@ -90,8 +115,14 @@ class Receiver:
     def stamp() -> str:
         return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
 
-    def seen(self, sha256: str) -> Optional[dict]:
-        """같은 바이트를 이미 받았는가(원장 received.jsonl). 거부된 수신은 세지 않는다."""
+    @staticmethod
+    def manifest_sha(manifest_bytes: Optional[bytes]) -> Optional[str]:
+        return hashlib.sha256(manifest_bytes).hexdigest() if manifest_bytes is not None else None
+
+    def seen(self, sha256: str, manifest_sha256: Optional[str] = None) -> Optional[dict]:
+        """같은 수신을 이미 받았는가(원장 received.jsonl) — ZIP 바이트와 manifest 가 **둘 다** 같을 때만.
+        manifest 만 고쳐 다시 보낸 것(mst·dir 정정)은 새 수신이다 — 법령 MST 가 manifest 에만 있어 그걸 고친
+        재전송이 duplicate 로 막히면 영영 처리되지 않는다. 거부된 수신은 세지 않는다."""
         try:
             lines = self.paths.ledger.read_text(encoding="utf-8").splitlines()
         except OSError:
@@ -101,8 +132,11 @@ class Receiver:
                 entry = json.loads(line)
             except ValueError:
                 continue
-            if entry.get("sha256") == sha256 and entry.get("status") == "accepted":
-                return entry
+            if entry.get("sha256") != sha256 or entry.get("status") != "accepted":
+                continue
+            if manifest_sha256 and entry.get("manifest_sha256") not in (None, manifest_sha256):
+                continue                                 # 같은 ZIP, 다른 manifest — 새 수신
+            return entry
         return None
 
     def _ledger(self, entry: dict) -> None:
@@ -124,11 +158,12 @@ class Receiver:
     def accept(self, part: Path, stamp: str, stem: str, original: str, sha256: str, size: int,
                manifest_bytes: Optional[bytes]) -> Tuple[int, dict]:
         """다 받은 `.part` 를 검증해 수신 폴더에 확정한다. 반환: (HTTP 상태, 응답 본문)."""
-        dup = self.seen(sha256)
+        dup = self.seen(sha256, self.manifest_sha(manifest_bytes))
         if dup:
             part.unlink(missing_ok=True)
-            return 200, {"received": True, "duplicate": True, "stored": False, "sha256": sha256,
-                         "size_bytes": size, "first_received_at": dup.get("received_at"),
+            return 200, {"received": True, "duplicate": True, "stored": False, "filename": original,
+                         "sha256": sha256, "size_bytes": size, "received_at": _now(),
+                         "stored_as": dup.get("stored"), "first_received_at": dup.get("received_at"),
                          "first_stored_as": dup.get("stored")}
         try:
             facts = _zip_facts(part)
@@ -162,6 +197,7 @@ class Receiver:
         os.replace(part, self.paths.inbox / f"{stored}.zip")  # 그 다음 ZIP — 이 순간부터 처리 대상
         received_at = _now()
         self._ledger({"stamp": stamp, "original": original, "stored": f"{stored}.zip", "sha256": sha256,
+                      "manifest_sha256": self.manifest_sha(manifest_bytes),
                       "bytes": size, "received_at": received_at, "status": "accepted",
                       "documents": manifest.get("documents")})
         log.info("[law-ingest] accepted %s as %s.zip sha=%s bytes=%d", original, stored, sha256[:12], size)
@@ -223,19 +259,72 @@ class TemporalScheduler:
         self.cron, self.req, self.workers, self.tls = cron, req, workers, tls
         self.grace_sec, self.expect_hours = grace_sec, expect_hours
         self.client = self.worker = self.executor = self._task = None
+        self.worker_error: Optional[str] = None
+        self.create_namespace = _flag("LAW_TEMPORAL_CREATE_NAMESPACE", True)
 
     async def start(self) -> None:
         from temporalio.client import Client
         from . import temporal_schedule as TS
         from .worker import build_worker
         self.client = await Client.connect(self.address, namespace=self.namespace, tls=self.tls)
+        if self.create_namespace:
+            await self._ensure_namespace()
         await TS.ensure_schedule(self.client, task_queue=self.task_queue, req=self.req, cron=self.cron)
         self.executor = ThreadPoolExecutor(max_workers=self.workers)
         self.worker = build_worker(self.client, self.task_queue, self.executor, self.workers)
         self._task = asyncio.create_task(self.worker.run(), name="law-temporal-worker")
+        self._task.add_done_callback(self._worker_done)
         log.info("[law-ingest] temporal worker up: %s ns=%s queue=%s cron=%r",
                  self.address, self.namespace, self.task_queue, self.cron)
         await self.trigger("startup")
+
+    async def _ensure_namespace(self) -> None:
+        """네임스페이스가 없으면 만든다 — Temporal UI 로는 못 만들고 CLI 도 없는 사이트가 많다(새 사이트 첫 기동).
+        어떤 이유로든 실패하면 기동은 계속한다 — 그 뒤 create_schedule 이 진짜 오류를 낸다."""
+        from temporalio.api.workflowservice.v1 import DescribeNamespaceRequest, RegisterNamespaceRequest
+        from temporalio.service import RPCError, RPCStatusCode
+        svc = self.client.workflow_service
+        try:
+            await svc.describe_namespace(DescribeNamespaceRequest(namespace=self.namespace))
+            return
+        except RPCError as exc:
+            if exc.status != RPCStatusCode.NOT_FOUND:
+                log.warning("[law-ingest] describe_namespace(%s) 실패: %s", self.namespace, exc)
+                return
+        except Exception as exc:
+            log.warning("[law-ingest] describe_namespace(%s) 실패: %s", self.namespace, exc)
+            return
+        try:
+            from google.protobuf.duration_pb2 import Duration
+            await svc.register_namespace(RegisterNamespaceRequest(
+                namespace=self.namespace, description="법령 적재기(law_embedding) 수신 파이프라인",
+                workflow_execution_retention_period=Duration(seconds=30 * 86400)))
+        except Exception as exc:
+            log.error("[law-ingest] 네임스페이스 %s 생성 실패: %s", self.namespace, exc)
+            return
+        log.warning("[law-ingest] 네임스페이스 %s 를 새로 만들었다(보존 30일) — 반영 대기", self.namespace)
+        for _ in range(30):                              # 서버가 네임스페이스 캐시를 갱신할 때까지(보통 10초 안)
+            try:
+                await svc.describe_namespace(DescribeNamespaceRequest(namespace=self.namespace))
+                await asyncio.sleep(10)
+                return
+            except RPCError:
+                await asyncio.sleep(1)
+
+    def _worker_done(self, task: "asyncio.Task") -> None:
+        """워커 task 는 조용히 죽을 수 있다(SDK 가 로그만 남기고 예외를 task 에 담는다). 그러면 Schedule 은
+        계속 워크플로를 띄우는데 아무도 집지 않아 첫 실행이 Running 에 고착되고 overlap=SKIP 이 뒤를 전부
+        건너뛴다. 기록해 두고 /health 가 503 을 내게 한다."""
+        if task.cancelled():
+            self.worker_error = "cancelled"
+            return
+        exc = task.exception()
+        self.worker_error = f"{type(exc).__name__}: {exc}" if exc else "stopped"
+        if exc:
+            log.error("[law-ingest] temporal worker died: %s — /health 503, 파드 재기동이 필요하다", self.worker_error)
+
+    def healthy(self) -> bool:
+        return self._task is not None and not self._task.done()
 
     async def stop(self) -> None:
         if self.worker is not None:
@@ -257,25 +346,32 @@ class TemporalScheduler:
 
     async def status(self) -> dict:
         from . import temporal_schedule as TS
-        d = await TS.describe(self.client)
-        last = await TS.last_run(self.client)
-        worker_alive = self._task is not None and not self._task.done()
+        worker_alive = self.healthy()
         notes = attention(self.paths, self.grace_sec, self.expect_hours)
         if not worker_alive:
-            notes.append("worker_not_running")
+            notes.append(f"worker_not_running:{self.worker_error or 'not started'}")
         received = last_receipt(self.paths)
-        return {
+        base = {
             "mode": "temporal",
-            "state": "halted" if d["paused"] else ("running" if d["running"] else "idle"),
-            "halt": {"note": d["note"], "last_action_at": d["last_action_at"]} if d["paused"] else None,
             "attention": notes,
-            "schedule": d,
-            "last_run": last,
             "last_received_at": received,
             "hours_since_last_receipt": round(_age_sec(received) / 3600, 1) if received else None,
             **inbox_status(self.paths),
             "temporal": {"address": self.address, "namespace": self.namespace, "task_queue": self.task_queue,
-                         "worker_alive": worker_alive},
+                         "worker_alive": worker_alive, "worker_error": self.worker_error},
+        }
+        try:
+            d = await TS.describe(self.client)
+            last = await TS.last_run(self.client)
+        except Exception as exc:                        # Temporal 이 잠깐 안 보여도 폴더 기준 상태는 돌려준다
+            base["temporal"]["error"] = f"{type(exc).__name__}: {exc}"
+            return {**base, "state": "unknown", "halt": None, "schedule": None, "last_run": None}
+        return {
+            **base,
+            "state": "halted" if d["paused"] else ("running" if d["running"] else "idle"),
+            "halt": {"note": d["note"], "last_action_at": d["last_action_at"]} if d["paused"] else None,
+            "schedule": d,
+            "last_run": last,
         }
 
     async def runs(self, limit: int) -> List[dict]:
@@ -341,7 +437,11 @@ class _Prefs:
 
 def _from_env():
     """env → (paths, settings, prefs). 스케줄러 조립은 startup 에서(Temporal 접속이 비동기라)."""
-    load_env_file(os.getenv("LAW_ENV_FILE"))
+    env_file = os.getenv("LAW_ENV_FILE")
+    if env_file and not Path(env_file).is_file():
+        # 조용히 0키로 넘어가면 엉뚱한 지점(Weaviate 접속)에서 죽어 원인을 못 찾는다 — 여기서 바로 멈춘다.
+        raise RuntimeError(f"LAW_ENV_FILE 이 가리키는 파일이 없습니다: {env_file} — NFS 경로와 볼륨 번호를 확인하세요")
+    load_env_file(env_file)
     from .config import Settings
     root = os.getenv("LAW_ROOT")
     if not root:
@@ -373,7 +473,12 @@ def _local_scheduler(paths: IngestPaths, settings, prefs: _Prefs) -> LocalSchedu
 async def _start_scheduler(paths: IngestPaths, settings, prefs: _Prefs):
     """Temporal 우선. strict(LAW_SCHEDULER=temporal)면 못 붙을 때 기동 실패, auto 면 경고 후 로컬."""
     from .embedder import make_embedder
-    make_embedder(settings)                              # 모델·설정 오류를 기동 시점에 드러낸다
+    try:
+        make_embedder(settings)                          # 모델·설정 오류를 기동 시점에 드러낸다
+    except ModuleNotFoundError as exc:                   # .env.example 기본 EMBEDDING_BACKEND=local 을 그대로 둔 경우
+        raise RuntimeError(
+            f"임베딩 백엔드 '{settings.embedding_backend}' 를 쓸 수 없습니다({exc}) — 코드서빙에는 sentence-transformers 가 "
+            "없으니 .env 에 EMBEDDING_BACKEND=remote 와 EMBEDDING_API_URL/EMBEDDING_API_KEY 를 두세요") from exc
     if prefs.want_temporal:
         sched = _temporal_scheduler(paths, prefs)
         try:
@@ -391,9 +496,11 @@ async def _start_scheduler(paths: IngestPaths, settings, prefs: _Prefs):
 def create_app(paths: Optional[IngestPaths] = None, scheduler=None) -> FastAPI:
     """paths/scheduler 를 주면 그대로(테스트), 없으면 startup 때 env 로 만든다."""
     state = {"paths": paths, "sched": scheduler}
+    _setup_logging()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        log.info("[law-ingest] versions %s", _versions())
         if state["sched"] is None:
             paths_, settings, prefs = _from_env()
             state["paths"] = paths_
@@ -415,15 +522,30 @@ def create_app(paths: Optional[IngestPaths] = None, scheduler=None) -> FastAPI:
         return state["paths"]
 
     async def snapshot() -> dict:
-        return {"mode": sched().mode, "halted": await sched().halted()}
+        try:
+            return {"mode": sched().mode, "halted": await sched().halted()}
+        except Exception as exc:                        # Temporal 이 잠깐 안 보여도 수신 응답은 깨지지 않는다
+            return {"mode": sched().mode, "halted": None, "error": f"{type(exc).__name__}: {exc}"}
+
+    async def nudge(reason: str, body: dict) -> None:
+        """저장이 끝난 뒤의 trigger — 실패해도 수신은 성공이다(파일은 이미 있고 다음 주기·재기동이 집어간다)."""
+        try:
+            body["triggered"] = await sched().trigger(reason)
+        except Exception as exc:
+            body["triggered"] = False
+            body["trigger_error"] = f"{type(exc).__name__}: {exc}"
+            log.error("[law-ingest] trigger(%s) failed after storing %s: %s", reason, body.get("stored_as"), exc)
 
     def ops(token: Optional[str]) -> None:
         expected = os.getenv("LAW_OPS_TOKEN")
-        if not expected or token != expected:
+        if not expected or not token or not hmac.compare_digest(token, expected):
             raise HTTPException(status_code=403, detail="X-Law-Ops-Token 이 필요합니다")
 
     @app.get("/health")
     async def health():
+        s = sched()
+        if s is not None and hasattr(s, "healthy") and not s.healthy():
+            return JSONResponse({"status": "degraded", "error": getattr(s, "worker_error", None)}, status_code=503)
         return {"status": "ok"}
 
     @app.get("/api/v1/ping")
@@ -438,10 +560,11 @@ def create_app(paths: Optional[IngestPaths] = None, scheduler=None) -> FastAPI:
 
     @app.post("/api/v1/law/ingest")
     async def ingest(file: UploadFile = File(...), manifest: Optional[UploadFile] = File(None),
-                     kind: str = "law"):
+                     kind: str = "law", x_law_ops_token: Optional[str] = Header(default=None)):
         receiver = Receiver(paths_())
         stamp, stem = receiver.stamp(), _stem(file.filename)
         if kind == "ops":                                   # 운영용 전달(배포 번들·lib) — 변환 대상이 아니다
+            ops(x_law_ops_token)                            # 게이트웨이 키(상대 측)만으로는 ops/ 에 못 쓴다
             name = f"{stamp}_{_UNSAFE.sub('_', Path(file.filename or 'upload').name)}"
             part = paths_().ops / f".{name}.part"
         else:
@@ -466,10 +589,15 @@ def create_app(paths: Optional[IngestPaths] = None, scheduler=None) -> FastAPI:
             return {"received": True, "kind": "ops", "stored_as": final.name, "size_bytes": size,
                     "sha256": sha.hexdigest(), "received_at": _now()}
         manifest_bytes = await manifest.read() if manifest is not None else None
-        status, body = receiver.accept(part, stamp, stem, file.filename or "upload.zip",
-                                       sha.hexdigest(), size, manifest_bytes)
-        if body.get("stored"):
-            body["triggered"] = await sched().trigger("ingest")
+        try:
+            status, body = receiver.accept(part, stamp, stem, file.filename or "upload.zip",
+                                           sha.hexdigest(), size, manifest_bytes)
+        except Exception as exc:                            # 암호화 ZIP·깨진 deflate·bytes 비숫자 등 — 500 과 .part 고아 대신 422
+            log.warning("[law-ingest] accept failed for %s: %s", file.filename, exc)
+            status, body = receiver._reject(part, stamp, stem, sha.hexdigest(), size, file.filename or "upload.zip",
+                                            f"수신 검증 실패: {type(exc).__name__}: {exc}")
+        if body.get("stored") or body.get("duplicate"):     # duplicate 도 깨운다 — 앞선 수신의 trigger 가 실패했을 수 있다
+            await nudge("ingest", body)
         body["pipeline"] = await snapshot()
         return JSONResponse(body, status_code=status)
 
