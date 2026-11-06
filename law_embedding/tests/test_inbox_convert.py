@@ -31,6 +31,9 @@ def test_law_payload_has_identity_from_manifest_mst(tmp_path):
     assert p["law_id"] == "001282" and p["mst"] == "290605"
     assert p["version_uid"] == "001282:290605:20261002"
     assert p["articles"] == 4 and p["appendices"] == 2
+    with zipfile.ZipFile(tmp_path / "batch-20261021-001.zip") as z:
+        body = json.loads(z.read([n for n in z.namelist() if n.endswith(".json")][0]))
+    assert "lsiSeq=290605" in body["appendices"][0]["view_url"]       # 진짜 mst 면 별표 링크가 산다
 
 
 def test_admrul_payload_from_raw_body(tmp_path):
@@ -263,6 +266,10 @@ def test_tworine_delivery_format_is_converted(tmp_path):
     assert names == ["별표1_검사의 봉급표.pdf", "별표2_검사의 봉급기준표.pdf"]
     new_mf = C.write_manifest(tmp_path / "out.zip", rep["docs"], tmp_path / "out.manifest.json")
     assert new_mf["docs"] == [{"id": "001282", "mst": "21490", "dir": "law/법률/검사의 보수에 관한 법률"}]
+    with zipfile.ZipFile(tmp_path / "out.zip") as z:
+        body = json.loads(z.read([n for n in z.namelist() if n.endswith(".json")][0]))
+    ap = body["appendices"][0]
+    assert ap["view_url"] == "" and ap["file_url"]        # 대체 mst 는 법제처 별표 링크(lsiSeq)에 못 쓴다 — 비운다
     r = read_zip(tmp_path / "out.zip", manifest=new_mf)
     assert r.errors == [] and len(r.documents) == 1 and r.documents[0].accepted and len(r.documents[0].files) == 2
 

@@ -64,15 +64,16 @@ def _stats(articles, addenda, appendices, attachments=None) -> dict:
     return d
 
 
-def assemble_law(body_json: dict, law_id: str, mst: str, law_name: str, at: str = "") -> dict:
+def assemble_law(body_json: dict, law_id: str, mst: str, law_name: str, at: str = "", viewer: bool = True) -> dict:
     """수집기 build_payload 의 관계 없는 조립. mst 는 본문 응답에 없어 manifest 로 받는다.
 
     at 은 fetched_at/synced_at 에 쓸 시각 — 비우면 지금. 변환은 같은 입력에 같은 바이트를
-    내야 하므로(convert_zip 참고) 배달 ZIP 에서 뽑은 시각을 넘긴다."""
+    내야 하므로(convert_zip 참고) 배달 ZIP 에서 뽑은 시각을 넘긴다.
+    viewer=False 면 별표 view_url 을 비운다 — mst 가 공포번호 대체값일 때 lsiSeq 에 넣으면 엉뚱한 링크가 된다."""
     fv = _c.first_value_recursive
     articles = _c.build_articles(body_json)
     addenda = _c.build_addenda(body_json)
-    appendices = _c.build_appendices(body_json, viewer=("lsBylInfoPLinkR.do", "lsiSeq", str(mst)))
+    appendices = _c.build_appendices(body_json, viewer=("lsBylInfoPLinkR.do", "lsiSeq", str(mst)) if viewer else None)
     basic_info = fv(body_json, ["기본정보"])
     if not isinstance(basic_info, dict):
         basic_info = {}
@@ -176,10 +177,10 @@ def assemble_admrul(body_json: dict, aid: str, seq: str, name: str, target: str 
     return payload
 
 
-def convert_payload(body_json: dict, doc: dict, source: str, name: str, at: str = "") -> dict:
+def convert_payload(body_json: dict, doc: dict, source: str, name: str, at: str = "", viewer: bool = True) -> dict:
     """원본 body_json → 적재기 payload. doc 은 manifest docs[] 의 {id, mst, dir}."""
     if source == "law":
-        return assemble_law(body_json, doc.get("id") or "", doc.get("mst") or "", name, at=at)
+        return assemble_law(body_json, doc.get("id") or "", doc.get("mst") or "", name, at=at, viewer=viewer)
     return assemble_admrul(body_json, doc.get("id") or "", doc.get("mst") or "", name, at=at)
 
 
@@ -360,10 +361,12 @@ def convert_zip(zip_path: Path, manifest: dict, out_zip: Path) -> dict:
                 continue
             try:
                 body_json = json.loads(src.read(by_name[jpath]).decode("utf-8-sig"))
-                if source == "law" and not doc.get("mst"):
+                real_mst = bool(doc.get("mst"))
+                if source == "law" and not real_mst:
                     doc["mst"] = _law_mst_fallback(body_json)
                     report["mst_fallback"] += 1
-                payload = convert_payload(body_json, doc, source, PurePosixPath(jpath).stem, at=at)
+                payload = convert_payload(body_json, doc, source, PurePosixPath(jpath).stem, at=at,
+                                          viewer=real_mst)           # 대체값은 법제처 별표 링크(lsiSeq)에 못 쓴다
             except Exception as exc:                 # 한 문서가 깨져도 나머지는 변환해 보고에 모은다
                 report["errors"].append({"path": jpath, "error": f"{type(exc).__name__}: {exc}"})
                 continue
