@@ -40,8 +40,10 @@ from .lawgo_raw import law as _law
 FORMAT_PRIORITY = (".pdf", ".hwpx", ".hwp", ".docx")
 
 # law.go.kr 원본 파일명: [별표 1] 제목(법령명).hwp  /  [별지 2의3] 제목.pdf
-_ORIG = re.compile(r"^\[(?P<kind>[가-힣]+)\s*(?P<no>\d+)(?:의(?P<branch>\d+))?\]\s*"
-                   r"(?P<title>.+?)\s*(?:\([^()]*\))?\.(?P<ext>[A-Za-z0-9]+)$")
+#   서식은 [별지 제100호서식]·[별지 제3호의2서식] 꼴로 오는데 JSON 은 서식100_ 으로 선언하고,
+#   번호 없는 [별표]·[별지] 는 별표0_·별지0_ 으로 선언한다(mdexport.appendix_label).
+_ORIG = re.compile(r"^\[(?P<kind>[가-힣]+?)\s*(?:제\s*)?(?P<no>\d+)?\s*(?:호)?(?:\s*의\s*(?P<branch>\d+))?"
+                   r"\s*(?P<form>서식)?\]\s*(?P<title>.+?)\s*(?:\([^()]*\))?\.(?P<ext>[A-Za-z0-9]+)$")
 # 적재기가 기대하는 이름: 별표1_제목.pdf  /  별지2의3_제목.pdf
 _WANT = re.compile(r"^(?P<kind>[가-힣]+)(?P<no>\d+)(?:의(?P<branch>\d+))?_")
 
@@ -202,6 +204,9 @@ def _documents_as_docs(manifest: dict) -> tuple:
         allowed.add(path)
         for f in d.get("files") or []:
             p, orig = f.get("path") or "", f.get("originalName") or ""
+            # 원래 이름에 '/' 가 들어 있다(…(Application …/ Certificate of Authentication)…) — 그대로 붙이면 폴더가
+            # 하나 더 생겨 고아가 된다. 경로 구분자만 mdexport._safe 와 같이 '_' 로 바꾼다.
+            orig = orig.replace("/", "_").replace("\\", "_")
             if p and orig and p.rsplit("/", 1)[-1] != orig:
                 alias[p] = (p.rsplit("/", 1)[0] + "/" + orig) if "/" in p else orig
     return docs_by_dir, alias, allowed
@@ -256,18 +261,28 @@ def plan_files(payload: dict, members: list) -> tuple:
         if m:
             want[(m["kind"], int(m["no"]), int(m["branch"]) if m["branch"] else None)] = ap["filename"]
     declared = {a.get("name") for a in (payload.get("attachments") or []) if a.get("name")}
-    groups = {}
+    groups, attach_rename = {}, {}
     for path in members:
         base = path.rsplit("/", 1)[-1]
         if base in declared:
             continue
+        # 법제처는 첨부 파일명의 ',' 를 '¸'(U+00B8)로 바꿔 내려준다 — 본문의 첨부파일명 선언은 ',' 그대로다.
+        if base.replace("¸", ",") in declared:
+            attach_rename[path] = base.replace("¸", ",")
+            continue
         m = _ORIG.match(base)
         if not m:
             continue
-        key = (m["kind"], int(m["no"]), int(m["branch"]) if m["branch"] else None)
-        if key in want:
-            groups.setdefault(key, []).append((path, "." + m["ext"].lower()))
-    rename, drop = {}, []
+        no, branch = int(m["no"] or 0), int(m["branch"]) if m["branch"] else None
+        keys = ([("서식", no, branch)] if m["form"] else []) + [(m["kind"], no, branch)]
+        key = next((k for k in keys if k in want), None)
+        if key is None:
+            continue
+        # 번호 없는 별표는 한 문서에 여럿이면 키가 겹친다 — 제목이 선언과 같을 때만 잇는다(다른 별표를 잇거나 버리지 않게).
+        if no == 0 and " ".join(m["title"].split()) != " ".join(want[key].split("_", 1)[-1].rsplit(".", 1)[0].split()):
+            continue
+        groups.setdefault(key, []).append((path, "." + m["ext"].lower()))
+    rename, drop = dict(attach_rename), []
     for key, items in groups.items():
         target = want[key]
         declared_ext = "." + target.rsplit(".", 1)[-1].lower()

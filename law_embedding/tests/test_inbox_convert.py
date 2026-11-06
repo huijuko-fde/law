@@ -101,6 +101,37 @@ def test_plan_files_does_not_confuse_1_with_10():
     assert drop == []
 
 
+def test_plan_files_reads_form_and_unnumbered_labels():
+    """2026-10-29 운영 배달분 — [별지 제N호서식] 은 서식N_, 번호 없는 [별표]·[별지] 는 별표0_·별지0_ 로 선언된다.
+    전에는 원본 이름을 못 읽어 첨부가 전부 attachment_orphan 이 되고 ZIP 이 partial(HALT)로 멈췄다."""
+    payload = {"attachments": [], "appendices": [
+        {"filename": "서식100_압수ㆍ수색ㆍ검증영장 신청서(사후).pdf"},
+        {"filename": "서식3의2_가 신청서.pdf"},
+        {"filename": "별표0_기관장 감독보고 시기(제8조 관련).hwp"},
+        {"filename": "별지0_조사개시통지서(제17조 제3항 관련).pdf"},
+    ]}
+    d = "law/시행규칙/중대범죄수사청 사건사무규칙/별표/"
+    a = "admrul/훈령/교정본부 보고사무지침/별표/"
+    members = [
+        d + "[별지 제100호서식] 압수ㆍ수색ㆍ검증영장 신청서(사후)(중대범죄수사청 사건사무규칙).hwp",
+        d + "[별지 제100호서식] 압수ㆍ수색ㆍ검증영장 신청서(사후)(중대범죄수사청 사건사무규칙).pdf",
+        d + "[별지 제3호의2서식] 가 신청서(중대범죄수사청 사건사무규칙).pdf",
+        a + "[별표] 기관장 감독보고 시기(제8조 관련)(교정본부 보고사무지침).hwp",
+        a + "[별지] 조사개시통지서(제17조 제3항 관련)(교정특별사법경찰 운영규정).hwpx",
+        a + "[별지] 조사개시통지서(제17조 제3항 관련)(교정특별사법경찰 운영규정).pdf",
+        a + "[별표] 다른 제목의 번호 없는 별표(교정본부 보고사무지침).hwp",   # 키는 같지만 제목이 달라 잇지 않는다
+    ]
+    rename, drop = C.plan_files(payload, members)
+    assert rename == {
+        members[1]: "서식100_압수ㆍ수색ㆍ검증영장 신청서(사후).pdf",
+        members[2]: "서식3의2_가 신청서.pdf",
+        members[3]: "별표0_기관장 감독보고 시기(제8조 관련).hwp",
+        members[5]: "별지0_조사개시통지서(제17조 제3항 관련).pdf",
+    }
+    assert sorted(drop) == sorted([members[0], members[4]])          # 같은 서식의 다른 형식만 버린다
+    assert members[6] not in rename and members[6] not in drop
+
+
 # ── 결정성 · 게시 규약 · ZIP 단위 격리 (LAW-28 운영 가동 전제) ─────────────
 #
 # 자동 경로에서는 변환기가 매 실행 돈다. 같은 입력이면 같은 바이트를 내야 consume-zip 의 SHA-256
@@ -298,3 +329,29 @@ def test_tworine_pair_round_trips_through_convert_inbox(tmp_path):
     assert [r["status"] for r in reports] == ["converted"]
     written = json.loads((tmp_path / "converted" / "20261105-203428-313052_law-1-1.manifest.json").read_text(encoding="utf-8"))
     assert written["docs"][0]["mst"] == "21490" and written["documents"] == 1
+
+
+def test_documents_alias_keeps_slash_in_original_name_inside_one_folder():
+    """2026-10-29 운영 배달분 — 원래 이름에 '/' 가 든 서식(…Apostille/ Certificate of Authentication…)이
+    되돌린 경로에서 폴더를 하나 더 만들어 고아가 됐다. 경로 구분자는 '_' 로 바꿔 같은 폴더에 둔다."""
+    manifest = {"documents": [{"path": "law/시행규칙/가/가.json", "lawId": "1", "files": [
+        {"path": "law/시행규칙/가/별표/별표5.hwp",
+         "originalName": "[별지 제5호서식] 신청서(Application for Apostille/ Certificate of Authentication)(가).hwp"},
+    ]}]}
+    _, alias, _ = C._documents_as_docs(manifest)
+    restored = alias["law/시행규칙/가/별표/별표5.hwp"]
+    assert restored == ("law/시행규칙/가/별표/"
+                        "[별지 제5호서식] 신청서(Application for Apostille_ Certificate of Authentication)(가).hwp")
+    payload = {"attachments": [], "appendices": [{"filename": "서식5_신청서(Application for Apostille_ Certificate of Authentication).pdf"}]}
+    rename, _ = C.plan_files(payload, [restored])
+    assert rename == {restored: "서식5_신청서(Application for Apostille_ Certificate of Authentication).hwp"}
+
+
+def test_plan_files_restores_comma_that_lawgo_turned_into_cedilla():
+    """법제처는 첨부 파일명의 ',' 를 '¸'(U+00B8)로 내려준다 — 본문 선언 이름(',')으로 되돌려야 연결된다."""
+    declared = "2.「교정사고 유형별 문책기준 지침」개정안 전문(법무부예규 제1295호, 2022.4.1. 일부개정).hwp"
+    payload = {"appendices": [], "attachments": [{"name": declared}, {"name": "1.교정사고 유형별 문책기준 지침 일부개정안.hwp"}]}
+    d = "admrul/예규/교정사고 유형별 문책기준 지침/"
+    members = [d + declared.replace(",", "¸"), d + "1.교정사고 유형별 문책기준 지침 일부개정안.hwp"]
+    rename, drop = C.plan_files(payload, members)
+    assert rename == {members[0]: declared} and drop == []
