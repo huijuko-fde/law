@@ -164,7 +164,7 @@ write_packages(result, Path("/mnt/handoff/packages"))        # source 별 <sourc
 - 같은 ZIP 을 **같은 manifest 로** 다시 보내면 200 `duplicate` — 저장·적재하지 않습니다(ZIP 바이트 SHA-256 + manifest 바이트 기준). manifest 만 고쳐(mst·dir 정정) 다시 보내면 새 수신입니다. duplicate 라도 멈춤이 아니면 스케줄을 한 번 깨웁니다(앞선 수신의 trigger 가 실패했을 때를 위해).
 - 내용을 고쳐 다시 보내면 새 수신입니다(파일명만 바꾼 것은 바이트가 같아 duplicate). 수신 시각 접두가 붙어 **도착 순서 = 처리 순서**이고, 그 법령은 갱신됩니다 — 같은 버전(version_uid)이면 제자리 덮어쓰기 + 이번 결과에 없는 청크 정리, 새 버전이면 교체.
 - **옛 버전은 건너뜁니다.** 저장된 것보다 (시행일, MST — 행정규칙은 개정일, 일련번호) 가 작으면 적재하지 않고 `version_skipped` 로 기록합니다(실패가 아닙니다). 최신판을 일부러 되돌릴 때만 `consume-zip --allow-older-version`(수동).
-- manifest(`docs[].mst` 포함)는 **같은 요청의 `manifest` 필드**로 보냅니다. 없으면 422 — law 의 MST 가 manifest 에만 있어 변환할 수 없습니다. 받은 ZIP 은 `rejected/` 에 남깁니다. manifest 의 `sha256`·`bytes` 가 받은 바이트와 다르면 역시 422(전송 손상).
+- manifest 는 **같은 요청의 `manifest` 필드**로 보냅니다. 없으면 422, 받은 ZIP 은 `rejected/` 에 남깁니다. manifest 의 `sha256`·`bytes` 가 있고 받은 바이트와 다르면 역시 422(전송 손상). 두 형식을 받습니다 — 10/21 샘플의 `docs[]{id, mst, dir}` 와 **투라인 운영 배달(10/27~)의 `documents[]{path, lawId, promulgationDate, effectiveDate, sha256, docType, kind, name, files[]{originalName, path, …}}`**. 후자는 별표·첨부가 `별표/별표1.hwp`·`첨부/첨부1.hwpx` 로 개명돼 오고(원래 이름은 `files[].originalName`), ZIP 안에 `manifest.json` 이 같이 들어 있으며 law 에 mst 가 없습니다. 변환기가 원래 이름으로 되돌려 매칭하고, 동봉 manifest.json 은 무시하고, law 의 mst 는 본문 기본정보의 **공포번호**로 대신합니다(행정규칙은 본문의 행정규칙일련번호). 공포번호도 개정마다 커지므로 버전 가드(시행일, 번호)가 그대로 동작하지만, 초기 적재분이 진짜 mst 로 들어간 사이트(genos.genon.ai)에서는 **같은 시행일의 같은 버전 재전송**이 번호 체계가 달라 `version_skipped` 가 됩니다(새 개정은 시행일이 뒤라 문제없음). 투라인이 `documents[].mst` 를 넣어 주면 그대로 씁니다.
 - 한 ZIP 20MB 이하(게이트웨이 본문 한도 실측 ~25MB).
 
 ### 멈춤(HALT)

@@ -79,8 +79,9 @@ def assemble_law(body_json: dict, law_id: str, mst: str, law_name: str, at: str 
     law_id = law_id or fv(body_json, ["법령ID", "ID"]) or ""
     if not mst:
         # version_uid = law_id:mst:시행일 — mst 가 비면 기존 적재분과 형식이 어긋나 같은 법령이
-        # 두 버전으로 들어간다. 본문 응답엔 없는 값이라 manifest 로 받기로 했다(LAW-39).
-        raise ConvertError(f"law 문서의 mst 가 manifest 에 없습니다: {law_name}")
+        # 두 버전으로 들어간다. 본문 응답엔 없는 값이라 manifest 로 받고(LAW-39), 없으면 convert_zip 이
+        # 공포번호로 대신한다(_law_mst_fallback). 여기까지 비면 둘 다 없는 것.
+        raise ConvertError(f"law 문서의 mst 가 manifest 에도, 본문에 공포번호도 없습니다: {law_name}")
     if not articles:
         raise ConvertError(f"본문 조회 실패(조문 0건): {law_name} (mst={mst})")
     law_type = fv(body_json, ["법령구분명", "법령구분"]) or ""
@@ -180,6 +181,39 @@ def convert_payload(body_json: dict, doc: dict, source: str, name: str, at: str 
     if source == "law":
         return assemble_law(body_json, doc.get("id") or "", doc.get("mst") or "", name, at=at)
     return assemble_admrul(body_json, doc.get("id") or "", doc.get("mst") or "", name, at=at)
+
+
+# ── 투라인 실제 manifest(2026-10-27 이후) ────────────────────────────────────
+# 10/21 샘플은 docs[]{id, mst, dir} 였는데 운영 배달분은 documents[]{path, lawId, promulgationDate, sha256,
+# docType, kind, name, files[]{originalName, path, size, sha256, kind, title}, skippedFiles, effectiveDate,
+# ministry} 이고 mst 가 없다. 별표·첨부 파일은 `별표/별표1.hwp`·`첨부/첨부1.hwpx` 로 개명돼 있고 원래
+# 이름([별표 1] 제목(법령명).hwp)은 files[].originalName 에만 있다. ZIP 안에 manifest.json 도 들어 있다.
+# 둘 다 받는다 — 매칭·게시는 원래 이름 기준으로 되돌려 하고, law 의 mst 는 본문의 공포번호로 대신한다.
+
+def _documents_as_docs(manifest: dict) -> tuple:
+    """documents[] → (docs_by_dir, alias: ZIP 멤버 경로→원래 이름 경로, allowed: 문서 JSON 경로 집합)."""
+    docs_by_dir, alias, allowed = {}, {}, set()
+    for d in manifest.get("documents") or []:
+        path = d.get("path") or ""
+        folder = path.rsplit("/", 1)[0] if "/" in path else ""
+        docs_by_dir[folder] = {"id": str(d.get("lawId") or d.get("id") or ""), "mst": str(d.get("mst") or ""),
+                               "dir": folder}
+        allowed.add(path)
+        for f in d.get("files") or []:
+            p, orig = f.get("path") or "", f.get("originalName") or ""
+            if p and orig and p.rsplit("/", 1)[-1] != orig:
+                alias[p] = (p.rsplit("/", 1)[0] + "/" + orig) if "/" in p else orig
+    return docs_by_dir, alias, allowed
+
+
+def _law_mst_fallback(body_json: dict) -> str:
+    """law 의 mst(법령일련번호)가 manifest 에 없을 때 — 본문 기본정보의 공포번호. 개정마다 커지는 값이라
+    version_rank(시행일, 번호)의 둘째 키 역할을 한다. 그것도 없으면 법령키(법령ID6+시행일8+공포번호)의 꼬리."""
+    no = _c.first_value_recursive(body_json, ["공포번호"])
+    if no:
+        return str(no).strip()
+    key = str(_c.first_value_recursive(body_json, ["법령키"]) or "")
+    return key[14:] if len(key) > 14 and key[:14].isdigit() else ""
 
 
 def _member_names(archive: zipfile.ZipFile) -> list:
@@ -298,19 +332,27 @@ def _entry(name: str, like: zipfile.ZipInfo) -> zipfile.ZipInfo:
 
 def convert_zip(zip_path: Path, manifest: dict, out_zip: Path) -> dict:
     """배달 ZIP 1건 변환. 반환: 보고 dict(문서·rename·drop·오류). 같은 입력이면 같은 바이트를 쓴다."""
-    docs_by_dir = {d["dir"]: d for d in manifest.get("docs") or []}
+    if manifest.get("docs"):
+        docs_by_dir, alias, allowed = {d["dir"]: d for d in manifest["docs"]}, {}, None
+    else:
+        docs_by_dir, alias, allowed = _documents_as_docs(manifest)
     report = {"zip": zip_path.name, "documents": 0, "renamed": 0, "dropped": 0, "kept": 0,
-              "dropped_unsupported": 0, "errors": [], "payloads": []}
+              "dropped_unsupported": 0, "ignored": 0, "mst_fallback": 0, "errors": [], "payloads": [],
+              "docs": list(docs_by_dir.values())}
     out_zip.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path) as src, zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as dst:
-        members = _member_names(src)
+        members = [(raw, alias.get(name, name)) for raw, name in _member_names(src)]   # 개명된 첨부 → 원래 이름
         by_name = {name: raw for raw, name in members}
         at = _zip_clock(src.infolist())
         for jpath in [n for _, n in members if n.endswith(".json")]:
+            if PurePosixPath(jpath).name == "manifest.json" or (allowed and jpath not in allowed):
+                report["ignored"] += 1                   # ZIP 에 동봉된 manifest.json 등 — 문서가 아니다
+                continue
             folder = jpath.rsplit("/", 1)[0] if "/" in jpath else ""
             doc = docs_by_dir.get(folder)
             if doc is None:
-                report["errors"].append({"path": jpath, "error": "manifest docs[] 에 이 문서 폴더가 없습니다"})
+                report["errors"].append({"path": jpath, "error": "manifest docs[] 에 이 문서 폴더가 없습니다"
+                                         if docs_by_dir else "manifest 에 문서 목록(docs[] 또는 documents[])이 없습니다"})
                 continue
             source = folder.split("/", 1)[0]
             if source not in ("law", "admrul"):
@@ -318,6 +360,9 @@ def convert_zip(zip_path: Path, manifest: dict, out_zip: Path) -> dict:
                 continue
             try:
                 body_json = json.loads(src.read(by_name[jpath]).decode("utf-8-sig"))
+                if source == "law" and not doc.get("mst"):
+                    doc["mst"] = _law_mst_fallback(body_json)
+                    report["mst_fallback"] += 1
                 payload = convert_payload(body_json, doc, source, PurePosixPath(jpath).stem, at=at)
             except Exception as exc:                 # 한 문서가 깨져도 나머지는 변환해 보고에 모은다
                 report["errors"].append({"path": jpath, "error": f"{type(exc).__name__}: {exc}"})
@@ -399,7 +444,7 @@ def convert_one(zp: Path, outbox: Path, *, done_dir: Optional[Path] = None,
         report.update(convert_zip(zp, manifest, part))
         if report["errors"]:
             raise ConvertError(f"문서 {len(report['errors'])}건 변환 실패")
-        write_manifest(part, manifest.get("docs") or [], final_mf, file_name=zp.name,
+        write_manifest(part, manifest.get("docs") or report.get("docs") or [], final_mf, file_name=zp.name,
                        source={"file": zp.name, "sha256": source_sha})
         os.replace(part, final_zip)
         report["status"] = CONVERTED

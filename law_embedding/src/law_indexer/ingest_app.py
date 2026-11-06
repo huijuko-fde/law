@@ -196,16 +196,20 @@ class Receiver:
         os.replace(tmp, manifest_path)                      # manifest 먼저
         os.replace(part, self.paths.inbox / f"{stored}.zip")  # 그 다음 ZIP — 이 순간부터 처리 대상
         received_at = _now()
+        # 투라인 운영 manifest 는 documents 가 건수가 아니라 문서 목록(파일 목록까지, 수십 KB)이다 — 원장엔 건수만.
+        docs = manifest.get("docs") or (manifest["documents"] if isinstance(manifest.get("documents"), list) else [])
+        doc_count = manifest.get("documents") if isinstance(manifest.get("documents"), int) else \
+            (manifest.get("documentCount") if isinstance(manifest.get("documentCount"), int) else len(docs))
         self._ledger({"stamp": stamp, "original": original, "stored": f"{stored}.zip", "sha256": sha256,
                       "manifest_sha256": self.manifest_sha(manifest_bytes),
                       "bytes": size, "received_at": received_at, "status": "accepted",
-                      "documents": manifest.get("documents")})
-        log.info("[law-ingest] accepted %s as %s.zip sha=%s bytes=%d", original, stored, sha256[:12], size)
+                      "documents": doc_count})
+        log.info("[law-ingest] accepted %s as %s.zip sha=%s bytes=%d docs=%s", original, stored, sha256[:12],
+                 size, doc_count)
         return 200, {"received": True, "duplicate": False, "stored": True, "filename": original,
                      "stored_as": f"{stored}.zip", "size_bytes": size, "sha256": sha256,
                      "received_at": received_at, "zip": facts,
-                     "manifest": {"documents": manifest.get("documents"),
-                                  "docs": len(manifest.get("docs") or [])}}
+                     "manifest": {"documents": doc_count, "docs": len(docs)}}
 
 
 # ── 스케줄러 — 같은 인터페이스 둘: Temporal(운영) / 로컬 러너(Temporal 없는 환경) ───────────────

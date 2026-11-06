@@ -76,12 +76,19 @@ def test_converted_zip_passes_read_zip_with_no_errors(tmp_path):
         assert len(r.documents[0].files) == files
 
 
-def test_law_without_mst_is_rejected(tmp_path):
-    """mst 없이 변환하면 version_uid 가 '001282::…' 가 되어 중복 버전을 만든다 — 막는다."""
+def test_law_without_mst_falls_back_to_promulgation_no(tmp_path):
+    """manifest 에 mst 가 없으면 본문 기본정보의 공포번호로 대신한다(투라인 운영 manifest 에는 mst 가 없다).
+    그것도 없으면 version_uid 가 '001282::…' 가 되어 중복 버전을 만들므로 막는다."""
+    import pytest
     mf = json.loads((FIX / "batch-20261021-001.manifest.json").read_text(encoding="utf-8"))
     mf["docs"][0] = {**mf["docs"][0], "mst": ""}
     rep = C.convert_zip(FIX / "batch-20261021-001.zip", mf, tmp_path / "x.zip")
-    assert rep["documents"] == 0 and "mst" in rep["errors"][0]["error"]
+    assert rep["documents"] == 1 and rep["mst_fallback"] == 1 and rep["payloads"][0]["mst"] == "21490"
+    assert C._law_mst_fallback({}) == "" and C._law_mst_fallback({"법령": {"법령키": "0048672026110636801"}}) == "36801"
+    with pytest.raises(C.ConvertError, match="mst"):
+        C.assemble_law({}, "1", "", "x")
+    rep = C.convert_zip(FIX / "batch-20261021-001.zip", {}, tmp_path / "y.zip")      # 문서 목록이 아예 없는 manifest
+    assert rep["documents"] == 0 and "문서 목록" in rep["errors"][0]["error"]
 
 
 def test_plan_files_does_not_confuse_1_with_10():
@@ -160,11 +167,11 @@ def test_partial_document_failure_publishes_nothing(tmp_path):
     inbox = _inbox_with(tmp_path, "batch-20261021-001")
     mf_path = inbox / "batch-20261021-001.manifest.json"
     mf = json.loads(mf_path.read_text(encoding="utf-8"))
-    mf["docs"][0]["mst"] = ""
+    mf["docs"][0]["dir"] = "law/법률/없는 폴더"                 # 문서 하나가 manifest 와 안 맞는다
     mf_path.write_text(json.dumps(mf, ensure_ascii=False), encoding="utf-8")
     outbox, failed = tmp_path / "out", tmp_path / "failed"
     [rep] = C.convert_inbox(inbox, outbox, failed_dir=failed)
-    assert rep["status"] == "failed" and "mst" in rep["errors"][0]["error"]
+    assert rep["status"] == "failed" and "문서 폴더" in rep["errors"][0]["error"]
     assert list(outbox.iterdir()) == []
     assert (failed / "batch-20261021-001.zip").exists()
     report = json.loads((failed / "batch-20261021-001.convert-report.json").read_text(encoding="utf-8"))
@@ -198,3 +205,89 @@ def test_undeclared_junk_and_unsupported_files_are_dropped(tmp_path):
     with zipfile.ZipFile(tmp_path / "out.zip") as z:
         names = sorted(n.rsplit("/", 1)[-1] for n in z.namelist() if not n.endswith(".json"))
     assert names == ["별표1_검사의 봉급표.pdf", "별표2_검사의 봉급기준표.pdf"]
+
+
+# ── 투라인 운영 배달 형식 (2026-10-27 이후 실제 배달분 — 10/21 샘플과 다르다) ──────────────
+
+def _tworine_style(name, tmp_path):
+    """10/21 샘플 ZIP 을 투라인 운영 배달 모양으로 다시 싼다 — documents[] manifest(mst 없음), 별표·첨부 개명
+    (별표/별표1.hwp, 첨부/첨부1.hwpx, 원래 이름은 files[].originalName), ZIP 안에 manifest.json 동봉."""
+    old = json.loads((FIX / f"{name}.manifest.json").read_text(encoding="utf-8"))
+    out = tmp_path / f"{name}-tworine.zip"
+    by_dir, counters = {}, {}
+    with zipfile.ZipFile(FIX / f"{name}.zip") as zin, zipfile.ZipFile(out, "w") as zout:
+        names = [n for n in zin.namelist() if not n.endswith("/")]
+        for n in [n for n in names if n.endswith(".json")]:
+            data = zin.read(n)
+            folder, base = n.rsplit("/", 1)
+            d = next(x for x in old["docs"] if x["dir"] == folder)
+            by_dir[folder] = {"path": n, "lawId": d["id"], "promulgationDate": "20261106",
+                              "sha256": hashlib.sha256(data).hexdigest(),
+                              "docType": "LAW" if folder.startswith("law/") else "ADMIN_RULE",
+                              "kind": folder.split("/")[1], "name": base[:-5], "files": [], "skippedFiles": [],
+                              "effectiveDate": "20261106", "ministry": "법무부"}
+            zout.writestr(n, data)
+        for n in [n for n in names if not n.endswith(".json")]:
+            data = zin.read(n)
+            base = n.rsplit("/", 1)[-1]
+            doc_dir = max((d for d in by_dir if n.startswith(d + "/")), key=len)
+            m = C._ORIG.match(base)
+            ext = base.rsplit(".", 1)[-1]
+            if m:
+                new = f"{m['kind']}{int(m['no'])}" + (f"의{int(m['branch'])}" if m["branch"] else "") + f".{ext}"
+                new_path, kind = f"{doc_dir}/별표/{new}", ("PDF" if ext == "pdf" else "서식파일")
+            else:
+                counters[doc_dir] = counters.get(doc_dir, 0) + 1
+                new_path, kind = f"{doc_dir}/첨부/첨부{counters[doc_dir]}.{ext}", "첨부"
+            by_dir[doc_dir]["files"].append({"originalName": base, "path": new_path, "size": len(data),
+                                             "sha256": hashlib.sha256(data).hexdigest(), "kind": kind, "title": base})
+            zout.writestr(new_path, data)
+        manifest = {"documentCount": len(by_dir), "documents": list(by_dir.values()), "part": 1,
+                    "generatedAt": "2026-11-05T20:34:27.443311813Z", "source": "국가법령정보센터(법제처)"}
+        zout.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False))
+    return out, manifest
+
+
+def test_tworine_delivery_format_is_converted(tmp_path):
+    """documents[] manifest · 개명된 별표 · 동봉 manifest.json · law 에 mst 없음(공포번호로 대체) — 전부 받는다.
+    10/27 첫 배달이 'manifest docs[] 에 이 문서 폴더가 없습니다' 로 HALT 돼 열흘간 31건이 쌓였던 것."""
+    zp, mf = _tworine_style("batch-20261021-001", tmp_path)
+    rep = C.convert_zip(zp, mf, tmp_path / "out.zip")
+    assert rep["errors"] == [] and rep["documents"] == 1 and rep["ignored"] == 1 and rep["mst_fallback"] == 1
+    p = rep["payloads"][0]
+    assert p["mst"] == "21490" and p["version_uid"] == "001282:21490:20261002"       # 기본정보.공포번호
+    assert rep["renamed"] == 2 and rep["dropped"] == 4                                   # hwp/pdf/gif → pdf 하나
+    with zipfile.ZipFile(tmp_path / "out.zip") as z:
+        assert "manifest.json" not in z.namelist()
+        names = sorted(n.rsplit("/", 1)[-1] for n in z.namelist() if not n.endswith(".json"))
+    assert names == ["별표1_검사의 봉급표.pdf", "별표2_검사의 봉급기준표.pdf"]
+    new_mf = C.write_manifest(tmp_path / "out.zip", rep["docs"], tmp_path / "out.manifest.json")
+    assert new_mf["docs"] == [{"id": "001282", "mst": "21490", "dir": "law/법률/검사의 보수에 관한 법률"}]
+    r = read_zip(tmp_path / "out.zip", manifest=new_mf)
+    assert r.errors == [] and len(r.documents) == 1 and r.documents[0].accepted and len(r.documents[0].files) == 2
+
+
+def test_tworine_admrul_delivery_keeps_attachment_and_seq(tmp_path):
+    """행정규칙은 본문에 행정규칙일련번호가 있어 mst 대체 없이 그대로, 첨부(첨부/첨부1.hwpx)는 원래 이름으로."""
+    zp, mf = _tworine_style("batch-20261021-002", tmp_path)
+    rep = C.convert_zip(zp, mf, tmp_path / "out.zip")
+    assert rep["errors"] == [] and rep["documents"] == 1 and rep["mst_fallback"] == 0
+    assert rep["payloads"][0]["mst"] == "2100000285778"
+    with zipfile.ZipFile(tmp_path / "out.zip") as z:
+        assert any(n.endswith("「수용자 교육교화 운영지침」 일부 개정 전문.hwpx") for n in z.namelist())
+    new_mf = C.write_manifest(tmp_path / "out.zip", rep["docs"], tmp_path / "out.manifest.json")
+    r = read_zip(tmp_path / "out.zip", manifest=new_mf)
+    assert r.errors == [] and r.documents[0].accepted and len(r.documents[0].files) == 40
+
+
+def test_tworine_pair_round_trips_through_convert_inbox(tmp_path):
+    """수신기가 놓은 모양 그대로(ZIP + 같은 이름 .manifest.json) convert_inbox → converted/ 의 manifest 에 docs[] 가 생긴다."""
+    zp, mf = _tworine_style("batch-20261021-001", tmp_path)
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    shutil.copy(zp, inbox / "20261105-203428-313052_law-1-1.zip")
+    (inbox / "20261105-203428-313052_law-1-1.manifest.json").write_text(json.dumps(mf, ensure_ascii=False), encoding="utf-8")
+    reports = C.convert_inbox(inbox, tmp_path / "converted", done_dir=tmp_path / "done", failed_dir=tmp_path / "failed")
+    assert [r["status"] for r in reports] == ["converted"]
+    written = json.loads((tmp_path / "converted" / "20261105-203428-313052_law-1-1.manifest.json").read_text(encoding="utf-8"))
+    assert written["docs"][0]["mst"] == "21490" and written["documents"] == 1

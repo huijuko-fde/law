@@ -335,3 +335,15 @@ def test_env_file_must_exist(tmp_path, monkeypatch):
     monkeypatch.setenv("LAW_ENV_FILE", str(tmp_path / "missing.env"))
     with pytest.raises(RuntimeError, match="LAW_ENV_FILE"):
         I._from_env()
+
+
+def test_tworine_manifest_documents_list_is_counted_not_stored(env):
+    """투라인 운영 manifest 는 documents 가 문서 목록(파일 목록까지, 수십 KB) — 원장에는 건수만 남긴다."""
+    client, paths, runner = env
+    data = _zip_bytes({"law/x/x.json": "{}"})
+    mf = {"documentCount": 1, "part": 1,
+          "documents": [{"path": "law/x/x.json", "lawId": "1", "files": [{"originalName": "a", "path": "law/x/별표/별표1.hwp"}] * 50}]}
+    body = _post(client, "law-1.zip", data, mf).json()
+    assert body["stored"] and body["manifest"] == {"documents": 1, "docs": 1}
+    entry = json.loads(paths.ledger.read_text(encoding="utf-8").splitlines()[-1])
+    assert entry["documents"] == 1
