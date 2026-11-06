@@ -224,7 +224,9 @@ async def main() -> None:
 
     # 모델을 먼저 로드해 첫 activity 지연·모델 오류를 워커 기동 시점에 드러낸다.
     _get_embedder()
-    client = await Client.connect(address, namespace=namespace, tls=tls)
+    token = (os.getenv("TEMPORAL_AUTH_TOKEN") or "").strip()      # GenOS gRPC 게이트(ext_authz) 통과용
+    client = await Client.connect(address, namespace=namespace, tls=tls,
+                                  rpc_metadata={"authorization": f"Bearer {token}"} if token else {})
 
     # 동기 activity(임베딩·weaviate)는 스레드풀에서 실행. 색인은 CPU·I/O 혼합이라 소수 워커면 충분.
     # ⚠ max_concurrent_activities 를 **스레드풀 크기와 같게** 못 박는다. 안 주면 기본 100 이라

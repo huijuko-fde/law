@@ -215,7 +215,7 @@ write_packages(result, Path("/mnt/handoff/packages"))        # source 별 <sourc
 | 임베딩 모델서빙 | bge-m3 — 질의 쪽(law_agent)과 **같은 모델** | `EMBEDDING_API_URL`, `EMBEDDING_API_KEY` |
 | 전처리기 코드서빙 | genos 전처리기 패키지 | `DOC_PARSER_BASE_URL`, `DOC_PARSER_API_KEY` |
 | 코드스페이스 | NFS 볼륨이 같이 생김 → 그 안에 `law-inbox/` 폴더 | `LAW_ROOT`(파드 쪽 경로 `/nfs-root/DEV/volume/<id>/law-inbox`) |
-| Temporal | 코드스페이스에서 `python3 -c "import socket;socket.create_connection(('temporal-frontend.temporal.svc.cluster.local',7233),3);print('OK')"` | 있으면 `LAW_SCHEDULER=temporal`, 없으면 `local` |
+| Temporal | GenOS 의 Temporal gRPC 는 **frontend 직결이 아니라 게이트** `llmops-temporal-grpc-gateway.llmops.svc.cluster.local:7233` 로 붙어야 한다(요청마다 GenOS 관리자 JWT 를 admin-api 가 검증 — helm/temporal README 「접근 제어」). frontend 로 바로 붙으면 TCP 는 열리지만 첫 RPC 에서 `connection closed`. 확인: 코드스페이스에서 `curl -s -o /dev/null -w '%{http_code}\n' --http2-prior-knowledge -m 5 http://llmops-temporal-grpc-gateway.llmops.svc.cluster.local:7233/x` → `403`(게이트 있음, 토큰 없어 거부) | `TEMPORAL_ADDRESS`=게이트, `GENOS_LOGIN_ID`/`GENOS_LOGIN_PASSWORD`=관리자 계정(파드가 로그인해 12시간 JWT 를 받고 만료 전 갱신). 게이트가 없는 사이트는 `local` |
 | Temporal 네임스페이스 | 파드가 첫 기동 때 **없으면 만듭니다**(`LAW_TEMPORAL_CREATE_NAMESPACE=true` 기본, 보존 30일). Temporal UI 로는 못 만들고, 권한 문제로 실패하면 기동 로그에 `네임스페이스 … 생성 실패` 가 찍히니 그때는 아래 수동 생성 | `TEMPORAL_NAMESPACE` |
 
 수동 생성(번들 푼 폴더에서, 베이스 파이썬 3.12):
@@ -237,7 +237,7 @@ PY
 
 **1. 코드 준비(개발 PC)** — `scripts/make_codeserving_bundle.sh ../../_bundle_cs800` → `main.py + src/law_indexer + lib/`. 그 사이트 `template-code-serving` 의 파이썬이 3.12 가 아니면 스크립트의 `--python-version`·`--abi` 를 맞춰 다시 받습니다. zip 으로 묶고 20MB 를 넘으면 `split -b 19m`. **폐쇄망 반입이면 이 번들 zip 을 소스와 같이 가져갑니다** — `lib/` 의 wheel(weaviate-client 와 의존성)은 PyPI 에서 받는 것이라 현장에서는 만들 수 없습니다. 노드가 x86_64·파이썬 3.12 가 아니면 `lib/` 전체가 무용하니 반입 전에 확인(기동 로그 `versions` 줄의 `machine`·`python`).
 
-**2. 수신 코드서빙** — 관리자 UI 에서 코드서빙 신규(내부 Gitea 저장소가 같이 생김) → 코드스페이스 VS Code 탐색기에 번들 zip 을 끌어다 놓고 풀어 그 저장소 내용으로 통째 교체 → `git push`(Password 프롬프트에는 GenOS 토큰) → 리비전 추가(그 커밋, 이미지 `template-code-serving`, START/BUILD 비움, 복제본 1, HA 끔).
+**2. 수신 코드서빙** — 관리자 UI 에서 코드서빙 신규(내부 Gitea 저장소가 같이 생김) → 코드스페이스 VS Code 탐색기에 번들 zip 을 끌어다 놓고 풀어 그 저장소 내용으로 통째 교체 → `git push`(Password 프롬프트에는 GenOS 토큰) → 리비전 추가(그 커밋, 이미지 `template-code-serving`, START/BUILD 비움, 복제본 1, HA 끔, **「NFS 루트 마운트」= 사용** — 끄면 `/nfs-root` 가 안 보여 `.env`·inbox 를 못 읽는다). **환경변수와 NFS 마운트는 리비전마다 다시 넣어야 한다**(이전 리비전 것이 이어지지 않는다 — 2026-11-06 실측).
 
 **3. 설정** — 코드스페이스에서 `law-inbox/.env` 작성(`.env.example` 을 그 사이트 값으로: `WEAVIATE_*`·`LAW_COLLECTION`·**`EMBEDDING_BACKEND=remote`**(기본 `local` 을 두면 sentence-transformers 가 없어 기동 실패)·`EMBEDDING_API_URL/KEY`·`DOC_PARSER_*`, `DOC_PARSER_SHARED_HOST_DIR`=`DOC_PARSER_SHARED_CONTAINER_DIR`=`<LAW_ROOT>/shared`), `mkdir -p law-inbox/shared && chmod 777 law-inbox/shared`. `LAW_ENV_FILE` 경로가 틀리면 기동 로그에 `LAW_ENV_FILE 이 가리키는 파일이 없습니다` 로 바로 멈춥니다. UI 환경변수:
 
@@ -245,9 +245,11 @@ PY
 LAW_ROOT=/nfs-root/DEV/volume/<id>/law-inbox
 LAW_ENV_FILE=/nfs-root/DEV/volume/<id>/law-inbox/.env
 LAW_OPS_TOKEN=<비밀값>
-LAW_SCHEDULER=temporal            # Temporal 이 없는 사이트는 local
-TEMPORAL_ADDRESS=temporal-frontend.temporal.svc.cluster.local:7233
+LAW_SCHEDULER=temporal            # Temporal 게이트가 없는 사이트는 local
+TEMPORAL_ADDRESS=llmops-temporal-grpc-gateway.llmops.svc.cluster.local:7233
 TEMPORAL_NAMESPACE=llmops
+GENOS_LOGIN_ID=<GenOS 관리자 계정>     # 게이트 통과용 — 값은 암호화 저장
+GENOS_LOGIN_PASSWORD=<비밀번호>
 ```
 
 배포 → 승인 → 가중치 100 → 이전 리비전 중지 → 상대 측에 줄 AuthKey 발급.

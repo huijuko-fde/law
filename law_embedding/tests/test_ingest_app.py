@@ -347,3 +347,104 @@ def test_tworine_manifest_documents_list_is_counted_not_stored(env):
     assert body["stored"] and body["manifest"] == {"documents": 1, "docs": 1}
     entry = json.loads(paths.ledger.read_text(encoding="utf-8").splitlines()[-1])
     assert entry["documents"] == 1
+
+
+def test_temporal_scheduler_sends_bearer_metadata(tmp_path, monkeypatch):
+    """GenOS Temporal gRPC 게이트(ext_authz)용 — TEMPORAL_AUTH_TOKEN 이 있으면 모든 RPC 에 authorization 메타데이터."""
+    import asyncio
+    import temporalio.client as TC
+    seen = {}
+
+    async def fake_connect(address, **kw):
+        seen.update(address=address, **kw)
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(TC.Client, "connect", staticmethod(fake_connect))
+    paths = IngestPaths(tmp_path / "root").ensure()
+    sched = I.TemporalScheduler(paths, address="gw:7233", namespace="llmops", task_queue="q", cron="0 * * * *",
+                                req=None, auth_token="tok")
+    with pytest.raises(RuntimeError, match="stop here"):
+        asyncio.run(sched.start())
+    assert seen["address"] == "gw:7233" and seen["rpc_metadata"] == {"authorization": "Bearer tok"}
+    sched = I.TemporalScheduler(paths, address="gw:7233", namespace="llmops", task_queue="q", cron="0 * * * *", req=None)
+    with pytest.raises(RuntimeError):
+        asyncio.run(sched.start())
+    assert seen["rpc_metadata"] == {}
+    monkeypatch.setenv("TEMPORAL_AUTH_TOKEN", " abc ")
+    monkeypatch.setenv("LAW_ROOT", str(tmp_path / "root"))
+    assert I._temporal_scheduler(paths, I._Prefs()).auth_token == "abc"
+
+
+def _jwt(exp):
+    import base64
+    body = base64.urlsafe_b64encode(json.dumps({"exp": exp, "type": "access"}).encode()).decode().rstrip("=")
+    return f"eyJhbGciOiJIUzI1NiJ9.{body}.sig"
+
+
+def test_jwt_exp_is_read_without_verification():
+    assert I._jwt_exp(_jwt(1_800_000_000)) == 1_800_000_000.0
+    assert I._jwt_exp("garbage") is None and I._exp_text(None) is None
+    assert I._exp_text(_jwt(1_800_000_000)).startswith("2027-01-15")
+
+
+def test_genos_login_fetches_access_token(monkeypatch):
+    """GenOS 관리자 로그인 → data.access_token. 실패·빈 응답은 원인이 적힌 오류."""
+    import asyncio
+    import httpx
+    calls = []
+
+    class _Resp:
+        def __init__(self, status, body):
+            self.status_code, self._body, self.text = status, body, json.dumps(body)
+
+        def json(self):
+            return self._body
+
+    class _Client:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json=None):
+            calls.append((url, json))
+            if json["password"] == "bad":
+                return _Resp(401, {"code": 401, "message": "wrong"})
+            return _Resp(200, {"code": 0, "data": {"access_token": _jwt(1_800_000_000), "refresh_token": "r"}})
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    login = I.GenosLogin("admin", "pw", base="http://admin:8080/")
+    assert I._jwt_exp(asyncio.run(login.fetch())) == 1_800_000_000.0
+    assert calls[-1] == ("http://admin:8080/auth/login", {"user_id": "admin", "password": "pw"})
+    with pytest.raises(RuntimeError, match="HTTP 401"):
+        asyncio.run(I.GenosLogin("admin", "bad", base="http://admin:8080").fetch())
+
+
+def test_temporal_scheduler_logs_in_before_connecting(tmp_path, monkeypatch):
+    import asyncio
+    import temporalio.client as TC
+    seen = {}
+
+    async def fake_connect(address, **kw):
+        seen.update(kw)
+        raise RuntimeError("stop here")
+
+    class _Login(I.GenosLogin):
+        async def fetch(self):
+            return _jwt(1_800_000_000)
+
+    monkeypatch.setattr(TC.Client, "connect", staticmethod(fake_connect))
+    paths = IngestPaths(tmp_path / "root").ensure()
+    sched = I.TemporalScheduler(paths, address="gw:7233", namespace="llmops", task_queue="q", cron="0 * * * *",
+                                req=None, login=_Login("admin", "pw", base="http://x"))
+    with pytest.raises(RuntimeError, match="stop here"):
+        asyncio.run(sched.start())
+    assert seen["rpc_metadata"] == {"authorization": f"Bearer {_jwt(1_800_000_000)}"} and sched.auth_kind == "login"
+    monkeypatch.setenv("GENOS_LOGIN_ID", " admin ")
+    monkeypatch.setenv("GENOS_LOGIN_PASSWORD", "pw")
+    built = I._temporal_scheduler(paths, I._Prefs())
+    assert built.login.user_id == "admin" and built.login.base == I.DEFAULT_ADMIN_API_URL

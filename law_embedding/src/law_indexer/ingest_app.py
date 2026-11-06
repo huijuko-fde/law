@@ -31,17 +31,21 @@
 env: LAW_ROOT(필수)  LAW_ENV_FILE(NFS 의 .env — 나머지 키를 여기서 읽는다, UI 값이 우선)
      LAW_SCHEDULER(auto|temporal|local)  LAW_SCHEDULE_CRON("0 * * * *", Asia/Seoul)  INDEX_TASK_QUEUE(law-embedding)
      TEMPORAL_HOST/TEMPORAL_PORT/TEMPORAL_NAMESPACE(genos 코드서빙이 주입) 또는 TEMPORAL_ADDRESS
+     GENOS_LOGIN_ID/GENOS_LOGIN_PASSWORD(GenOS 관리자 계정 — gRPC 게이트(llmops-temporal-grpc-gateway:7233)를
+     거칠 때 필수. 로그인해 받은 12시간짜리 JWT 를 만료 전에 갱신) 또는 TEMPORAL_AUTH_TOKEN(정적 JWT, 검증용)
      LAW_OPS_TOKEN(비우면 run/resume/requeue 막힘)  LAW_HALT_ON_PARTIAL(true)  LAW_RETENTION_DAYS(30, 0=영구)
      LAW_MANIFEST_GRACE_SEC(3600)  LAW_EXPECT_INTERVAL_HOURS(0=결손 감지 끔)  LAW_SWEEP_INTERVAL_SEC(600, local 전용)
 베이스 규약: repo 루트 main.py 가 이 모듈의 app 을 re-export 하면 entrypoint 가 `uvicorn main:app` 으로 띄운다.
 """
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
 import logging
 import os
 import re
+import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -212,6 +216,49 @@ class Receiver:
                      "manifest": {"documents": doc_count, "docs": len(docs)}}
 
 
+# ── GenOS 관리자 토큰 — Temporal gRPC 게이트(ext_authz) 통과용 ──────────────────────────────
+# GenOS 의 Temporal gRPC(:7233)는 frontend 직결이 아니라 앞단 Envoy 게이트(llmops-temporal-grpc-gateway)를
+# 거치고, 게이트는 요청마다 `authorization: Bearer <GenOS 관리자 JWT>` 를 admin-api 로 검증한다
+# (helm/temporal README 「접근 제어」). JWT 는 12시간짜리라 정적 토큰이면 워커가 반나절 뒤 끊긴다 —
+# 관리자 계정으로 로그인해 받고 만료 30분 전에 다시 받는다. frontend 로 바로 붙으면 TCP 는 열리지만 첫 RPC 에서
+# "connection closed" 로 끊긴다(2026-11-06 실측).
+DEFAULT_ADMIN_API_URL = "http://llmops-admin-api-service:8080"      # law_scope 와 같은 내부 주소
+
+
+def _exp_text(token: Optional[str]) -> Optional[str]:
+    exp = _jwt_exp(token or "")
+    return datetime.fromtimestamp(exp, timezone.utc).isoformat(timespec="minutes") if exp else None
+
+
+def _jwt_exp(token: str) -> Optional[float]:
+    """JWT payload 의 exp(epoch 초). 검증 없이 읽기만 — 갱신 시점을 잡는 용도."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return float(json.loads(base64.urlsafe_b64decode(payload))["exp"])
+    except Exception:
+        return None
+
+
+class GenosLogin:
+    """GenOS 관리자 로그인(POST /auth/login) → access_token."""
+
+    def __init__(self, user_id: str, password: str, base: Optional[str] = None):
+        self.user_id, self.password = user_id, password
+        self.base = (base or os.getenv("LLMOPS_ADMIN_API_URL") or DEFAULT_ADMIN_API_URL).rstrip("/")
+
+    async def fetch(self) -> str:
+        import httpx
+        async with httpx.AsyncClient(timeout=30) as http:
+            r = await http.post(f"{self.base}/auth/login", json={"user_id": self.user_id, "password": self.password})
+        if r.status_code != 200:
+            raise RuntimeError(f"GenOS 로그인 실패 HTTP {r.status_code} ({self.base}/auth/login, id={self.user_id}): {r.text[:200]}")
+        token = ((r.json() or {}).get("data") or {}).get("access_token")
+        if not token:
+            raise RuntimeError(f"GenOS 로그인 응답에 access_token 이 없습니다: {r.text[:200]}")
+        return token
+
+
 # ── 스케줄러 — 같은 인터페이스 둘: Temporal(운영) / 로컬 러너(Temporal 없는 환경) ───────────────
 
 class LocalScheduler:
@@ -258,19 +305,28 @@ class TemporalScheduler:
     mode = "temporal"
 
     def __init__(self, paths: IngestPaths, *, address: str, namespace: str, task_queue: str, cron: str,
-                 req, workers: int = 1, tls: bool = False, grace_sec: int = 3600, expect_hours: float = 0):
+                 req, workers: int = 1, tls: bool = False, grace_sec: int = 3600, expect_hours: float = 0,
+                 auth_token: Optional[str] = None, login: Optional[GenosLogin] = None):
         self.paths, self.address, self.namespace, self.task_queue = paths, address, namespace, task_queue
         self.cron, self.req, self.workers, self.tls = cron, req, workers, tls
         self.grace_sec, self.expect_hours = grace_sec, expect_hours
-        self.client = self.worker = self.executor = self._task = None
+        self.auth_token, self.login = auth_token, login
+        self.client = self.worker = self.executor = self._task = self._refresh = None
         self.worker_error: Optional[str] = None
         self.create_namespace = _flag("LAW_TEMPORAL_CREATE_NAMESPACE", True)
+
+    def _metadata(self) -> dict:
+        return {"authorization": f"Bearer {self.auth_token}"} if self.auth_token else {}
 
     async def start(self) -> None:
         from temporalio.client import Client
         from . import temporal_schedule as TS
         from .worker import build_worker
-        self.client = await Client.connect(self.address, namespace=self.namespace, tls=self.tls)
+        if self.login is not None:
+            self.auth_token = await self.login.fetch()
+            log.info("[law-ingest] genos login ok (id=%s, token exp=%s)", self.login.user_id, _exp_text(self.auth_token))
+        self.client = await Client.connect(self.address, namespace=self.namespace, tls=self.tls,
+                                           rpc_metadata=self._metadata())
         if self.create_namespace:
             await self._ensure_namespace()
         await TS.ensure_schedule(self.client, task_queue=self.task_queue, req=self.req, cron=self.cron)
@@ -278,9 +334,27 @@ class TemporalScheduler:
         self.worker = build_worker(self.client, self.task_queue, self.executor, self.workers)
         self._task = asyncio.create_task(self.worker.run(), name="law-temporal-worker")
         self._task.add_done_callback(self._worker_done)
-        log.info("[law-ingest] temporal worker up: %s ns=%s queue=%s cron=%r",
-                 self.address, self.namespace, self.task_queue, self.cron)
+        if self.login is not None:
+            self._refresh = asyncio.create_task(self._refresh_token_loop(), name="law-genos-token")
+        log.info("[law-ingest] temporal worker up: %s ns=%s queue=%s cron=%r auth=%s",
+                 self.address, self.namespace, self.task_queue, self.cron, self.auth_kind)
         await self.trigger("startup")
+
+    @property
+    def auth_kind(self) -> Optional[str]:
+        return "login" if self.login is not None else ("token" if self.auth_token else None)
+
+    async def _refresh_token_loop(self) -> None:
+        """만료 30분 전에 다시 로그인해 클라이언트(워커가 같이 쓴다)의 메타데이터를 바꾼다. 실패하면 5분 뒤 다시."""
+        while True:
+            exp = _jwt_exp(self.auth_token or "")
+            await asyncio.sleep(max(300, exp - time.time() - 1800) if exp else 6 * 3600)
+            try:
+                self.auth_token = await self.login.fetch()
+                self.client.rpc_metadata = self._metadata()
+                log.info("[law-ingest] genos token refreshed (exp=%s)", _exp_text(self.auth_token))
+            except Exception as exc:
+                log.error("[law-ingest] genos token refresh failed: %s — 5분 뒤 다시", exc)
 
     async def _ensure_namespace(self) -> None:
         """네임스페이스가 없으면 만든다 — Temporal UI 로는 못 만들고 CLI 도 없는 사이트가 많다(새 사이트 첫 기동).
@@ -331,6 +405,8 @@ class TemporalScheduler:
         return self._task is not None and not self._task.done()
 
     async def stop(self) -> None:
+        if self._refresh is not None:
+            self._refresh.cancel()
         if self.worker is not None:
             await self.worker.shutdown()
         if self.executor is not None:
@@ -362,7 +438,8 @@ class TemporalScheduler:
             "hours_since_last_receipt": round(_age_sec(received) / 3600, 1) if received else None,
             **inbox_status(self.paths),
             "temporal": {"address": self.address, "namespace": self.namespace, "task_queue": self.task_queue,
-                         "worker_alive": worker_alive, "worker_error": self.worker_error},
+                         "worker_alive": worker_alive, "worker_error": self.worker_error,
+                         "auth": self.auth_kind, "token_exp": _exp_text(self.auth_token) if self.auth_token else None},
         }
         try:
             d = await TS.describe(self.client)
@@ -463,7 +540,10 @@ def _temporal_scheduler(paths: IngestPaths, prefs: _Prefs) -> TemporalScheduler:
         task_queue=os.getenv("INDEX_TASK_QUEUE", "law-embedding"),
         cron=os.getenv("LAW_SCHEDULE_CRON", "0 * * * *"), req=req,
         workers=int(os.getenv("INDEX_ACTIVITY_WORKERS", "1")), tls=_flag("TEMPORAL_TLS", False),
-        grace_sec=prefs.grace_sec, expect_hours=prefs.expect_hours)
+        grace_sec=prefs.grace_sec, expect_hours=prefs.expect_hours,
+        auth_token=(os.getenv("TEMPORAL_AUTH_TOKEN") or "").strip() or None,
+        login=(GenosLogin(os.environ["GENOS_LOGIN_ID"].strip(), os.environ["GENOS_LOGIN_PASSWORD"])
+               if os.getenv("GENOS_LOGIN_ID") and os.getenv("GENOS_LOGIN_PASSWORD") else None))
 
 
 def _local_scheduler(paths: IngestPaths, settings, prefs: _Prefs) -> LocalScheduler:
