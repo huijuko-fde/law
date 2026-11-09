@@ -412,3 +412,38 @@ def test_plan_files_links_deleted_appendix_whose_declared_name_went_through_safe
         members[5]: "별표0_임상연구평가위원회의 설치기관, 대상기관, 관할 및 위원장.pdf",
     }
     assert sorted(drop) == sorted([members[0], members[2], members[4]])     # 선언 확장자(pdf)가 우선, hwp 는 버린다
+
+
+def test_plan_files_falls_back_to_title_for_label_forms_never_seen():
+    """라벨 꼴이 처음 보는 것이어도(부표·양식·〔〕·【】·라벨 없음) 같은 폴더 선언 중 제목이 하나만 같으면 잇는다.
+    변형이 나올 때마다 정규식을 늘리던 방식(2026-11-06~09 6종)을 끝내기 위한 것."""
+    payload = {"attachments": [], "appendices": [
+        {"filename": "별표3_수수료 기준.pdf"},
+        {"filename": "별지5_신청서(사후).pdf"},
+        {"filename": "서식7_확인서.pdf"},
+    ]}
+    d = "law/시행규칙/가법 시행규칙/별표/"
+    members = [
+        d + "[부표 3] 수수료 기준(가법 시행규칙).pdf",          # 종류 표기가 다름
+        d + "〔별지 5〕 신청서(사후)(가법 시행규칙).pdf",       # 괄호 꼴이 다르고 제목 끝에 괄호
+        d + "【양식 제7호】 확인서(가법 시행규칙).pdf",
+    ]
+    rename, drop = C.plan_files(payload, members)
+    assert rename == {members[0]: "별표3_수수료 기준.pdf", members[1]: "별지5_신청서(사후).pdf",
+                      members[2]: "서식7_확인서.pdf"}
+    assert drop == []
+
+
+def test_plan_files_title_fallback_never_guesses():
+    """제목만으로 못 가르거나 라벨 번호가 선언과 어긋나면 잇지 않는다 — 다른 별표에 붙는 것이 고아보다 나쁘다."""
+    payload = {"attachments": [], "appendices": [
+        {"filename": "별지1_삭제.pdf"}, {"filename": "별지2_삭제.pdf"}, {"filename": "별표3_수수료 기준.pdf"},
+    ]}
+    d = "law/가법/별표/"
+    members = [
+        d + "[양식 1] 삭제(가법).pdf",        # 제목 '삭제' 가 둘 — 라벨 번호 1 로 가른다 → 별지1
+        d + "삭제(가법).pdf",                 # 라벨이 없어 못 가른다 → 건드리지 않음
+        d + "[부표 9] 수수료 기준(가법).pdf",  # 제목은 같지만 번호 9 ≠ 3 → 건드리지 않음
+    ]
+    rename, drop = C.plan_files(payload, members)
+    assert rename == {members[0]: "별지1_삭제.pdf"} and drop == []

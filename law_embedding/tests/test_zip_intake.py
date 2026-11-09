@@ -315,8 +315,8 @@ def test_law_id_missing_or_not_string_rejected(tmp_path):
     assert result.errors == []
 
 
-def test_orphan_attachment_is_error(tmp_path):
-    """연결할 문서가 없는 첨부는 오류 — 문서는 그대로 싣는다."""
+def test_orphan_attachment_is_warning(tmp_path):
+    """연결할 문서가 없는 첨부는 경고 — 그 파일만 빼고 문서는 그대로 싣는다(2026-11-09, 첨부 하나로 ZIP 이 멈추지 않게)."""
     path = _zip(tmp_path, {
         "law/형법/형법.json": _law("001692", "형법"),
         "law/형법/별표/별표9_없음.hwp": b"X",          # 문서는 있으나 JSON 첨부 목록에 없음
@@ -324,8 +324,9 @@ def test_orphan_attachment_is_error(tmp_path):
     })
     result = read_zip(path)
 
-    assert _codes(result.errors) == ["attachment_orphan", "attachment_orphan"]
-    assert {e.path for e in result.errors} == {"law/형법/별표/별표9_없음.hwp", "law/떠돌이/별표1.hwp"}
+    assert result.errors == []
+    assert _codes(result.warnings) == ["attachment_orphan", "attachment_orphan"]
+    assert {e.path for e in result.warnings} == {"law/형법/별표/별표9_없음.hwp", "law/떠돌이/별표1.hwp"}
     assert [d.law_id for d in result.accepted()] == ["001692"]
 
 
@@ -423,7 +424,8 @@ def test_manifest_restores_renamed_attachment(tmp_path):
         {"url": appendix_b["file_url"], "path": f"law/형법/별표/{renamed}",
          "sha256": hashlib.sha256(second).hexdigest()}]}]}
 
-    assert _codes(read_zip(_zip(tmp_path, members, name="plain.zip")).errors) == ["attachment_orphan"]
+    plain = read_zip(_zip(tmp_path, members, name="plain.zip"))
+    assert plain.errors == [] and _codes(plain.warnings).count("attachment_orphan") == 1
 
     result = read_zip(_zip(tmp_path, members, name="mapped.zip"), manifest=manifest)
     assert result.errors == [] and result.documents[0].accepted

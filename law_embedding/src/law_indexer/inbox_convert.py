@@ -59,6 +59,27 @@ def _declared_title(filename: str) -> str:
     return _FLSEQ_SUFFIX.sub("", title)
 
 
+# 라벨을 못 읽는 새 꼴이 와도 쓰는 느슨한 분해 — `[아무 라벨] 제목(법령명).ext`. 끝 괄호가 법령명인지 제목의
+# 일부인지(`신청서(사후)`) 모르니 떼기 전·후를 둘 다 제목 후보로 본다.
+_LOOSE = re.compile(r"^(?:[\[〔【]\s*(?P<label>[^\]〕】]*)[\]〕】]\s*)?(?P<stem>.+)\.(?P<ext>[A-Za-z0-9]+)$")
+_TRAILING_PAREN = re.compile(r"\s*\([^()]*\)$")
+_DIGITS = re.compile(r"\d+")
+
+
+def _loose_titles(stem: str) -> set:
+    out = {_norm_title(stem)}
+    cut = _TRAILING_PAREN.sub("", stem)
+    if cut != stem:
+        out.add(_norm_title(cut))
+    return out
+
+
+def _label_no(label: Optional[str]) -> Optional[tuple]:
+    """라벨 속 숫자 → (번호, 가지). `[별지 제3호의2서식]` → (3, 2), `[별표 ]` → None(제약 없음)."""
+    nums = [int(x) for x in _DIGITS.findall(label or "")]
+    return (nums[0], nums[1] if len(nums) > 1 else None) if nums else None
+
+
 def _norm_title(title: str) -> str:
     """원본 제목을 선언 제목과 같은 꼴로 — 생산자(mdexport._safe)가 `<`·`>`·`/` 등 금지문자를 `_` 로 바꾸고,
     법제처는 `,` 를 `¸` 로 내려주므로 되돌린 뒤 _safe 를 거친다. 선언 쪽도 같은 함수로 접어 공백 차이를 없앤다."""
@@ -268,6 +289,36 @@ def _attachment_like(base: str) -> bool:
     return PurePosixPath(low).suffix in ZIP_ATTACHMENT_SUFFIXES
 
 
+def _target_by_key(base: str, want: dict) -> Optional[str]:
+    """라벨을 (종류·번호·가지) 로 읽어 선언에 잇는다. 키가 겹치면(번호 없는 별표 등) 제목으로 가른다."""
+    m = _ORIG.match(base)
+    if not m:
+        return None
+    no, branch = int(m["no"] or 0), int(m["branch"]) if m["branch"] else None
+    keys = ([("서식", no, branch)] if m["form"] else []) + [(m["kind"], no, branch)]
+    key = next((k for k in keys if k in want), None)
+    if key is None:
+        return None
+    targets = want[key]
+    if no == 0 or len(targets) > 1:
+        title = _norm_title(m["title"])
+        targets = [t for t in targets if _norm_title(_declared_title(t)) == title]
+    return targets[0] if len(targets) == 1 else None
+
+
+def _target_by_title(base: str, by_title: dict, no_of: dict) -> Optional[str]:
+    """라벨을 못 읽어도(처음 보는 꼴) 같은 폴더 선언 중 제목이 **하나만** 같으면 잇는다.
+    라벨에 숫자가 있으면 선언의 (번호, 가지)와도 같아야 한다 — 같은 제목 다른 번호(별지1_삭제·별지2_삭제)에 잘못 붙지 않게."""
+    m = _LOOSE.match(base)
+    if not m:
+        return None
+    cands = {fn for t in _loose_titles(m["stem"]) for fn in by_title.get(t, [])}
+    label_no = _label_no(m["label"])
+    if label_no is not None:
+        cands = {fn for fn in cands if no_of.get(fn) == label_no}
+    return next(iter(cands)) if len(cands) == 1 else None
+
+
 def plan_files(payload: dict, members: list) -> tuple:
     """같은 문서 폴더의 첨부 멤버 → (rename: 원본경로→새이름, drop: 버릴 경로).
 
@@ -275,39 +326,35 @@ def plan_files(payload: dict, members: list) -> tuple:
     appendices[].filename 에 맞추고, 같은 별표의 여러 형식은 하나만 남긴다."""
     # 한 키에 선언이 여럿일 수 있다 — 번호 없는 별표(삭제 <날짜> 등)가 한 문서에 여럿이면 전부 (별표, 0, None) 이고
     # 생산자가 `_flSeq<n>` 접미로 파일명만 가른다. 하나만 남기면(덮어쓰기) 나머지는 전부 고아가 된다.
-    want: dict = {}
+    want: dict = {}                         # (종류, 번호, 가지) → [선언 파일명]
+    by_title: dict = {}                     # 정규화 제목 → [선언 파일명]
+    no_of: dict = {}                        # 선언 파일명 → (번호, 가지)
     for ap in payload.get("appendices") or []:
-        m = _WANT.match(ap.get("filename") or "")
-        if m:
-            want.setdefault((m["kind"], int(m["no"]), int(m["branch"]) if m["branch"] else None), []).append(ap["filename"])
+        fn = ap.get("filename") or ""
+        m = _WANT.match(fn)
+        if not m:
+            continue
+        no_br = (int(m["no"]), int(m["branch"]) if m["branch"] else None)
+        want.setdefault((m["kind"],) + no_br, []).append(fn)
+        by_title.setdefault(_norm_title(_declared_title(fn)), []).append(fn)
+        no_of[fn] = no_br
     declared = {a.get("name") for a in (payload.get("attachments") or []) if a.get("name")}
+    # 원문 첨부 — 법제처는 ',' 를 '¸'(U+00B8)로 내려주고, 금지문자·공백도 흔들린다. 같은 정규화로 접어 비교한다.
+    declared_norm = {_norm_title(n): n for n in declared}
     groups, attach_rename = {}, {}
     for path in members:
         base = path.rsplit("/", 1)[-1]
         if base in declared:
             continue
-        # 법제처는 첨부 파일명의 ',' 를 '¸'(U+00B8)로 바꿔 내려준다 — 본문의 첨부파일명 선언은 ',' 그대로다.
-        if base.replace("¸", ",") in declared:
-            attach_rename[path] = base.replace("¸", ",")
+        if _norm_title(base) in declared_norm:
+            attach_rename[path] = declared_norm[_norm_title(base)]
             continue
-        m = _ORIG.match(base)
-        if not m:
-            continue
-        no, branch = int(m["no"] or 0), int(m["branch"]) if m["branch"] else None
-        keys = ([("서식", no, branch)] if m["form"] else []) + [(m["kind"], no, branch)]
-        key = next((k for k in keys if k in want), None)
-        if key is None:
-            continue
-        targets = want[key]
-        if no == 0 or len(targets) > 1:
-            # 키가 겹치면 제목으로 가른다 — 선언 제목은 `{종류}{번호}_{제목}[_flSeq<n>].{ext}` 의 가운데.
-            title = _norm_title(m["title"])
-            targets = [t for t in targets if _norm_title(_declared_title(t)) == title]
-            if len(targets) != 1:
-                continue                         # 못 가르면 건드리지 않는다(다른 별표를 잇거나 버리지 않게)
-        groups.setdefault((key, targets[0]), []).append((path, "." + m["ext"].lower()))
+        target = _target_by_key(base, want) or _target_by_title(base, by_title, no_of)
+        if target is None:
+            continue                             # 못 가르면 건드리지 않는다 — 소비 쪽이 경고로 남기고 본문은 싣는다
+        groups.setdefault(target, []).append((path, "." + base.rsplit(".", 1)[-1].lower()))
     rename, drop = dict(attach_rename), []
-    for (key, target), items in groups.items():
+    for target, items in groups.items():
         declared_ext = "." + target.rsplit(".", 1)[-1].lower()
 
         def rank(item):

@@ -277,6 +277,24 @@ def test_partial_rejected_document_excluded_rest_loaded(inbox, vdb, settings):
                for i in record["issues"])
 
 
+def test_orphan_attachment_does_not_halt_zip(inbox, vdb, settings):
+    """선언에 없는 첨부 파일 하나 때문에 ZIP 이 partial(→HALT)이 되지 않는다 — 문서는 싣고 done,
+    고아 수는 요약에 남는다(2026-11-09, 법제처 파일명 변형마다 파이프라인이 멈추던 것)."""
+    zip_path = _write_zip(inbox / "0001_batch.zip", {
+        "law/형법/형법.json": _law("001692", "형법"),
+        "law/형법/별표/[별표 99] 처음 보는 꼴(형법).hwp": b"X",
+    })
+    sha = _sha(zip_path)
+
+    summary = _run(settings, inbox)
+
+    assert summary["done"] == 1 and summary["partial"] == 0
+    assert {o.law_id for o in vdb.upserted} == {"001692"}
+    record = _state(inbox, sha)
+    assert record["status"] == "done" and record["summary"]["orphan_files"] == 1
+    assert any(i["code"] == "attachment_orphan" and i["level"] == "warning" for i in record["issues"])
+
+
 def test_corrupt_zip_quarantined_next_zip_continues(inbox, vdb, settings):
     """깨진 ZIP 은 failed/ 로 격리하고 다음 ZIP 은 그대로 처리한다."""
     (inbox / "0001_broken.zip").write_bytes(b"this is not a zip")

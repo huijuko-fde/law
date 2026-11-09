@@ -772,21 +772,25 @@ def _ancestors(path: str) -> Iterator[str]:
 def _link_files(docs: List[ZipDocument], files: List[ZipFileEntry], result: ZipIntakeResult) -> None:
     """첨부 파일을 문서에 연결한다 — 가장 가까운 상위 폴더의 문서 JSON 중 그 파일명을 첨부 목록에
     가진 문서. 한 폴더에 여러 문서(수집기 구조의 시행규칙 여럿 등)가 있어도 JSON 목록이 가른다.
-    목록에 가진 문서가 없으면 고아, 서로 다른 문서 둘 이상이면 모호 — 어느 쪽도 추측하지 않는다."""
+    목록에 가진 문서가 없으면 고아, 서로 다른 문서 둘 이상이면 모호 — 어느 쪽도 추측하지 않는다.
+
+    고아는 **경고**다(2026-11-09) — 그 파일만 싣지 않고 문서는 싣는다. 오류로 두면 법제처 파일명 변형 하나에
+    ZIP 전체가 partial → HALT 가 되어, 첨부 하나 때문에 법령 수백 건이 멈췄다. 선언 쪽 단위는 파일이 없으니
+    attachment_missing(pending) 으로 남아 다음 배달에서 채워진다."""
     by_dir: Dict[str, List[ZipDocument]] = defaultdict(list)
     for doc in docs:
         by_dir[doc.path.rsplit("/", 1)[0] if "/" in doc.path else ""].append(doc)
     for entry in files:
         folder = next((p for p in _ancestors(entry.path) if p in by_dir), None)
         if folder is None:
-            result.errors.append(Issue("error", "attachment_orphan",
-                                       "상위 폴더에 문서 JSON 이 없어 연결할 문서가 없습니다", path=entry.path))
+            result.warnings.append(Issue("warning", "attachment_orphan",
+                                         "상위 폴더에 문서 JSON 이 없어 연결할 문서가 없습니다", path=entry.path))
             continue
         candidates = [doc for doc in by_dir[folder] if entry.name in doc.declared]
         if not candidates:
             listed = ", ".join(doc.path.rsplit("/", 1)[-1] for doc in by_dir[folder])
-            result.errors.append(Issue(
-                "error", "attachment_orphan",
+            result.warnings.append(Issue(
+                "warning", "attachment_orphan",
                 f"가까운 문서 폴더({folder or '/'})의 JSON({listed}) 첨부 목록에 이 파일명이 없습니다",
                 path=entry.path))
             continue

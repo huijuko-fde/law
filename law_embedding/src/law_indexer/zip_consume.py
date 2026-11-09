@@ -364,7 +364,9 @@ def _fail(record: dict, issues: List[Issue], reason: str) -> dict:
 def _summary(result: ZipIntakeResult, written: List[dict]) -> dict:
     """이력 요약 — read_zip 의 문서·삭제·거부 수 + package 에 실은 첨부 수."""
     summary = result.summary()
-    summary["zip_errors"] = len(result.errors)          # 문서에 귀속되지 않는 오류(고아 첨부·경로·확장자 등)
+    summary["zip_errors"] = len(result.errors)          # 문서에 귀속되지 않는 오류(경로·확장자 등)
+    # 고아 첨부는 경고라 partial 을 만들지 않는다 — 대신 수를 남겨 운영에서 보이게 한다(2026-11-09).
+    summary["orphan_files"] = sum(1 for w in result.warnings if w.code == "attachment_orphan")
     summary["files"] = sum(w["files"] for w in written)
     summary["pending_attachments"] = sum(w["pending_attachments"] for w in written)
     return summary
