@@ -355,3 +355,60 @@ def test_plan_files_restores_comma_that_lawgo_turned_into_cedilla():
     members = [d + declared.replace(",", "¸"), d + "1.교정사고 유형별 문책기준 지침 일부개정안.hwp"]
     rename, drop = C.plan_files(payload, members)
     assert rename == {members[0]: declared} and drop == []
+
+
+def test_plan_files_links_each_deleted_appendix_when_several_share_no_zero():
+    """2026-11-06 재처리 뒤 남은 54건 — 한 법령에 삭제된 별표([별표 ] 삭제 <날짜>)가 여럿이면 전부 (별표,0) 라
+    생산자가 `_flSeq<n>` 으로 파일명만 가른다. 선언을 하나만 남기던 전 버전은 나머지를 전부 고아로 만들었다."""
+    payload = {"attachments": [], "appendices": [
+        {"filename": "별표0_삭제 <2014.11.3.>_flSeq11111111.hwp"},
+        {"filename": "별표0_삭제 <2016. 9. 27.>_flSeq22222222.hwp"},
+        {"filename": "별표1_수수료(제5조 관련).pdf"},
+    ]}
+    d = "law/시행규칙/검사의 국선변호사 선정 등에 관한 규칙/별표/"
+    members = [
+        d + "[별표 ] 삭제 <2014.11.3.>(검사의 국선변호사 선정 등에 관한 규칙).hwp",
+        d + "[별표 ] 삭제 <2014.11.3.>(검사의 국선변호사 선정 등에 관한 규칙).pdf",
+        d + "[별표 ] 삭제 <2016. 9. 27.>(검사의 국선변호사 선정 등에 관한 규칙).hwp",
+        d + "[별표 1] 수수료(제5조 관련)(검사의 국선변호사 선정 등에 관한 규칙).pdf",
+        d + "[별표 ] 삭제 <2020.1.1.>(검사의 국선변호사 선정 등에 관한 규칙).hwp",   # 선언에 없는 날짜 — 건드리지 않는다
+    ]
+    rename, drop = C.plan_files(payload, members)
+    assert rename == {
+        members[0]: "별표0_삭제 <2014.11.3.>_flSeq11111111.hwp",
+        members[2]: "별표0_삭제 <2016. 9. 27.>_flSeq22222222.hwp",
+        members[3]: "별표1_수수료(제5조 관련).pdf",
+    }
+    assert drop == [members[1]]
+    assert members[4] not in rename and members[4] not in drop
+    assert C._declared_title("별표0_삭제 <2014.11.3.>_flSeq11111111.hwp") == "삭제 <2014.11.3.>"
+    assert C._declared_title("별표3_개정 2014_연혁.pdf") == "개정 2014_연혁"      # 제목 속 '_' 와 숫자는 안 자른다
+
+
+def test_plan_files_links_deleted_appendix_whose_declared_name_went_through_safe():
+    """2026-11-09 남은 54건 전부 — 삭제된 별표·서식 `[별표 ] 삭제 <날짜>`·`[별지 서식] 삭제 <날짜>` 는 생산자가 제목의
+    `<`·`>` 를 `_` 로 바꿔 `별표0_삭제 _2014.11.3._.pdf` 로 선언한다. 제목 비교를 _safe 로 접지 않으면 영영 안 맞는다.
+    행정규칙 별표 제목의 `¸`(법제처가 바꾼 `,`)도 같은 길로 되돌린다."""
+    payload = {"attachments": [], "appendices": [
+        {"filename": "별표0_삭제 _2014.11.3._.pdf"},
+        {"filename": "서식0_삭제 _2009.3.31_.pdf"},
+        {"filename": "별표0_임상연구평가위원회의 설치기관, 대상기관, 관할 및 위원장.pdf"},
+    ]}
+    a = "law/시행규칙/검사의 국선변호사 선정 등에 관한 규칙/별표/"
+    b = "law/시행령/공무원임용령/별표/"
+    c = "admrul/훈령/교도소와 소년원 및 외국인보호소 등 의무관 임상연구비 지급지침/별표/"
+    members = [
+        a + "[별표 ] 삭제 <2014.11.3.>(검사의 국선변호사 선정 등에 관한 규칙).hwp",
+        a + "[별표 ] 삭제 <2014.11.3.>(검사의 국선변호사 선정 등에 관한 규칙).pdf",
+        b + "[별지 서식] 삭제 <2009.3.31>(공무원임용령).hwp",
+        b + "[별지 서식] 삭제 <2009.3.31>(공무원임용령).pdf",
+        c + "[별표] 임상연구평가위원회의 설치기관¸ 대상기관¸ 관할 및 위원장(교도소와 소년원 및 외국인보호소 등 의무관 임상연구비 지급지침).hwp",
+        c + "[별표] 임상연구평가위원회의 설치기관¸ 대상기관¸ 관할 및 위원장(교도소와 소년원 및 외국인보호소 등 의무관 임상연구비 지급지침).pdf",
+    ]
+    rename, drop = C.plan_files(payload, members)
+    assert rename == {
+        members[1]: "별표0_삭제 _2014.11.3._.pdf",
+        members[3]: "서식0_삭제 _2009.3.31_.pdf",
+        members[5]: "별표0_임상연구평가위원회의 설치기관, 대상기관, 관할 및 위원장.pdf",
+    }
+    assert sorted(drop) == sorted([members[0], members[2], members[4]])     # 선언 확장자(pdf)가 우선, hwp 는 버린다

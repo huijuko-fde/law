@@ -48,6 +48,24 @@ _ORIG = re.compile(r"^\[(?P<kind>[가-힣]+?)\s*(?:제\s*)?(?P<no>\d+)?\s*(?:호
 _WANT = re.compile(r"^(?P<kind>[가-힣]+)(?P<no>\d+)(?:의(?P<branch>\d+))?_")
 
 
+# 같은 라벨 별표가 여럿일 때 생산자(mdexport.appendix_fname)가 붙이는 꼬리 — flSeq 가 없으면 instance idx 도 숫자라 같은 꼴이다.
+_FLSEQ_SUFFIX = re.compile(r"_flSeq\d+$")
+
+
+def _declared_title(filename: str) -> str:
+    """선언 파일명 `별표0_삭제 <2014.11.3.>_flSeq12345.hwp` → 제목 `삭제 <2014.11.3.>`."""
+    stem = filename.rsplit(".", 1)[0]
+    title = stem.split("_", 1)[-1] if "_" in stem else ""
+    return _FLSEQ_SUFFIX.sub("", title)
+
+
+def _norm_title(title: str) -> str:
+    """원본 제목을 선언 제목과 같은 꼴로 — 생산자(mdexport._safe)가 `<`·`>`·`/` 등 금지문자를 `_` 로 바꾸고,
+    법제처는 `,` 를 `¸` 로 내려주므로 되돌린 뒤 _safe 를 거친다. 선언 쪽도 같은 함수로 접어 공백 차이를 없앤다."""
+    from .lawgo_raw.mdexport import _safe
+    return " ".join(_safe((title or "").replace("¸", ",")).split())
+
+
 class ConvertError(RuntimeError):
     pass
 
@@ -255,11 +273,13 @@ def plan_files(payload: dict, members: list) -> tuple:
 
     원문 첨부(attachments[].name)는 이름이 이미 맞으므로 그대로. 별표는 (종류·번호·가지)로
     appendices[].filename 에 맞추고, 같은 별표의 여러 형식은 하나만 남긴다."""
-    want = {}
+    # 한 키에 선언이 여럿일 수 있다 — 번호 없는 별표(삭제 <날짜> 등)가 한 문서에 여럿이면 전부 (별표, 0, None) 이고
+    # 생산자가 `_flSeq<n>` 접미로 파일명만 가른다. 하나만 남기면(덮어쓰기) 나머지는 전부 고아가 된다.
+    want: dict = {}
     for ap in payload.get("appendices") or []:
         m = _WANT.match(ap.get("filename") or "")
         if m:
-            want[(m["kind"], int(m["no"]), int(m["branch"]) if m["branch"] else None)] = ap["filename"]
+            want.setdefault((m["kind"], int(m["no"]), int(m["branch"]) if m["branch"] else None), []).append(ap["filename"])
     declared = {a.get("name") for a in (payload.get("attachments") or []) if a.get("name")}
     groups, attach_rename = {}, {}
     for path in members:
@@ -278,13 +298,16 @@ def plan_files(payload: dict, members: list) -> tuple:
         key = next((k for k in keys if k in want), None)
         if key is None:
             continue
-        # 번호 없는 별표는 한 문서에 여럿이면 키가 겹친다 — 제목이 선언과 같을 때만 잇는다(다른 별표를 잇거나 버리지 않게).
-        if no == 0 and " ".join(m["title"].split()) != " ".join(want[key].split("_", 1)[-1].rsplit(".", 1)[0].split()):
-            continue
-        groups.setdefault(key, []).append((path, "." + m["ext"].lower()))
+        targets = want[key]
+        if no == 0 or len(targets) > 1:
+            # 키가 겹치면 제목으로 가른다 — 선언 제목은 `{종류}{번호}_{제목}[_flSeq<n>].{ext}` 의 가운데.
+            title = _norm_title(m["title"])
+            targets = [t for t in targets if _norm_title(_declared_title(t)) == title]
+            if len(targets) != 1:
+                continue                         # 못 가르면 건드리지 않는다(다른 별표를 잇거나 버리지 않게)
+        groups.setdefault((key, targets[0]), []).append((path, "." + m["ext"].lower()))
     rename, drop = dict(attach_rename), []
-    for key, items in groups.items():
-        target = want[key]
+    for (key, target), items in groups.items():
         declared_ext = "." + target.rsplit(".", 1)[-1].lower()
 
         def rank(item):
